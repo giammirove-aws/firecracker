@@ -48,12 +48,13 @@ use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::PmemPersistError;
 use crate::devices::virtio::rng::persist::EntropyPersistError;
 use crate::devices::virtio::vsock::{VsockError, VsockUnixBackendError};
+use crate::devices::virtio::worker::WorkerError;
 use crate::logger::{error, info, warn};
 use crate::pci::bus::MAX_PCI_BUSES;
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
 use crate::rpc_interface::VmmActionError;
-use crate::seccomp::BpfProgram;
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::utils::open_file_nonblock;
 use crate::vmm_config::HotplugDeviceConfig;
@@ -112,6 +113,8 @@ pub enum AttachDeviceError {
     PciTransport(#[from] PciManagerError),
     /// Operation not supported on this VM type
     NotSupported,
+    /// Failed to spawn the device's worker threads: {0}
+    SpawnWorker(#[from] WorkerError),
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -133,8 +136,9 @@ pub struct DeviceManager {
     pub acpi_devices: ACPIDeviceManager,
     /// Virtio devices (MMIO or PCI)
     pub virtio_devices: VirtioDevices,
-    /// Seccomp filter installed on block worker threads
-    pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    /// Seccomp filters for device worker threads, by thread category. Kept so that devices
+    /// hotplugged after boot install the same filters as boot-time ones.
+    pub seccomp_filters: Arc<BpfThreadMap>,
 }
 
 impl DeviceManager {
@@ -247,7 +251,7 @@ impl DeviceManager {
         serial_rate_limiter: Option<TokenBucket>,
         pci_enabled: bool,
         pcie_hotplug_ports: u8,
-        blk_worker_filter: Option<Arc<BpfProgram>>,
+        seccomp_filters: Arc<BpfThreadMap>,
     ) -> Result<Self, DeviceManagerCreateError> {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = Self::create_legacy_devices(
@@ -265,7 +269,7 @@ impl DeviceManager {
             legacy_devices: Some(legacy_devices),
             acpi_devices: ACPIDeviceManager::default(),
             virtio_devices: Self::create_virtio_devices(pci_enabled, vm, pcie_hotplug_ports)?,
-            blk_worker_filter,
+            seccomp_filters,
         })
     }
 
@@ -292,7 +296,8 @@ impl DeviceManager {
         }
     }
 
-    /// Attaches a boot-time VirtioDevice device to the device and event managers.
+    /// Attaches a boot-time VirtioDevice device to the device and event managers, once it has its
+    /// worker threads.
     pub(crate) fn attach_boot_virtio_device<
         T: 'static + VirtioDevice + MutEventSubscriber + Debug,
     >(
@@ -305,6 +310,12 @@ impl DeviceManager {
         is_vhost_user: bool,
     ) -> Result<(), AttachDeviceError> {
         let vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
+        // The lock is a temporary, released at the end of this statement: attaching the device
+        // below locks it again.
+        device
+            .lock()
+            .expect("Poisoned lock")
+            .spawn_workers(&self.seccomp_filters)?;
         match &mut self.virtio_devices {
             VirtioDevices::Mmio(mmio_devices) => mmio_devices
                 .attach_mmio_virtio_device(vm, id, device, cmdline, event_manager, is_vhost_user)
@@ -503,6 +514,11 @@ impl DeviceManager {
             HotplugDeviceConfig::Pmem(cfg) => Self::hotplug_make_pmem(vm.clone(), cfg)?,
             HotplugDeviceConfig::Net(cfg) => self.hotplug_make_net(cfg)?,
         };
+        // As in `attach_boot_virtio_device`, the device is not locked across the attach.
+        device
+            .lock()
+            .expect("Poisoned lock")
+            .spawn_workers(&self.seccomp_filters)?;
 
         match &mut self.virtio_devices {
             VirtioDevices::Pci(pci_devices) => {
@@ -543,11 +559,7 @@ impl DeviceManager {
             return Err(DriveError::RootBlockDeviceAlreadyAdded.into());
         }
 
-        let mut block = Block::new(config).map_err(DriveError::CreateBlockDevice)?;
-        block
-            .spawn_worker(self.blk_worker_filter.clone())
-            .map_err(DriveError::CreateBlockDevice)?;
-
+        let block = Block::new(config).map_err(DriveError::CreateBlockDevice)?;
         Ok(Arc::new(Mutex::new(block)))
     }
 
@@ -756,6 +768,8 @@ pub enum DevicePersistError {
     DeviceActivation(#[from] ActivateError),
     /// Resource allocator error: {0}
     ResourceAllocator(#[from] vm_allocator::Error),
+    /// Could not spawn a device worker thread: {0}
+    SpawnWorker(#[from] WorkerError),
 }
 
 /// Errors for (de)serialization of the device manager.
@@ -780,7 +794,7 @@ pub struct DeviceRestoreArgs<'a> {
     pub vcpus_exit_evt: &'a EventFd,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
-    pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    pub seccomp_filters: Arc<BpfThreadMap>,
 }
 
 impl std::fmt::Debug for DeviceRestoreArgs<'_> {
@@ -853,7 +867,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                     event_manager: constructor_args.event_manager,
-                    blk_worker_filter: constructor_args.blk_worker_filter.clone(),
+                    seccomp_filters: constructor_args.seccomp_filters.clone(),
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
@@ -866,7 +880,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     event_manager: constructor_args.event_manager,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
-                    blk_worker_filter: constructor_args.blk_worker_filter.clone(),
+                    seccomp_filters: constructor_args.seccomp_filters.clone(),
                 };
                 let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
                     .map_err(DeviceManagerPersistError::MmioRestore)?;
@@ -880,7 +894,7 @@ impl<'a> Persist<'a> for DeviceManager {
             legacy_devices: Some(legacy_devices),
             acpi_devices,
             virtio_devices,
-            blk_worker_filter: constructor_args.blk_worker_filter,
+            seccomp_filters: constructor_args.seccomp_filters,
         })
     }
 }
@@ -897,6 +911,7 @@ pub(crate) mod tests {
     use crate::devices::acpi::vmclock::VmClock;
     use crate::devices::acpi::vmgenid::VmGenId;
     use crate::devices::virtio::block::CacheType;
+    use crate::devices::virtio::worker::DeviceState;
     use crate::rpc_interface::VmmActionError;
     use crate::vmm_config::HotplugDeviceConfig;
     use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
@@ -930,7 +945,7 @@ pub(crate) mod tests {
             legacy_devices: Some(legacy_devices),
             acpi_devices,
             virtio_devices,
-            blk_worker_filter: None,
+            seccomp_filters: Arc::new(crate::seccomp::get_empty_filters()),
         }
     }
 
@@ -1117,6 +1132,60 @@ pub(crate) mod tests {
                 .virtio_devices
                 .contains_key(&device_id)
         );
+    }
+
+    /// The worker threads a device has, if it is a configuring virtio drive.
+    fn block_worker_threads(device: &dyn VirtioDevice) -> usize {
+        match device.as_any().downcast_ref::<Block>() {
+            Some(Block::Virtio(block)) => match &block.state {
+                DeviceState::Configuring(_, handles) => handles.len(),
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn test_attach_spawns_workers() {
+        // Attaching a device gives it its worker threads, so that no device type needs a call
+        // of its own, which another device type could forget.
+        let mut vmm = default_vmm();
+        let mut cmdline = default_kernel_cmdline();
+        let mut event_manager = EventManager::new().unwrap();
+        let f = TempFile::new().unwrap();
+        let mut cfg = make_hotplug_block_cfg("threaded", &f, false);
+        cfg.num_queues = std::num::NonZeroU16::new(1);
+        let block = Arc::new(Mutex::new(Block::new(cfg).unwrap()));
+
+        vmm.device_manager.seccomp_filters = Arc::new(crate::seccomp::get_empty_filters());
+        vmm.device_manager
+            .attach_boot_virtio_device(
+                &vmm.vm,
+                "threaded".to_string(),
+                block.clone(),
+                &mut cmdline,
+                &mut event_manager,
+                false,
+            )
+            .unwrap();
+        assert_eq!(block_worker_threads(&*block.lock().unwrap()), 1);
+    }
+
+    #[test]
+    fn test_hotplug_spawns_workers() {
+        let mut evt_manager = EventManager::new().unwrap();
+        let mut vmm = default_vmm_with_hotplug_ports(1);
+        let f = TempFile::new().unwrap();
+        let mut cfg = make_hotplug_block_cfg("threaded", &f, false);
+        cfg.num_queues = std::num::NonZeroU16::new(1);
+
+        vmm.hotplug_device(HotplugDeviceConfig::Block(cfg), &mut evt_manager)
+            .unwrap();
+        let device = vmm
+            .device_manager
+            .get_virtio_device(VirtioDeviceType::Block, "threaded")
+            .unwrap();
+        assert_eq!(block_worker_threads(&*device.lock().unwrap()), 1);
     }
 
     #[test]

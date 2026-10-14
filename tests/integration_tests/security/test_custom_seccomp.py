@@ -56,7 +56,9 @@ def test_missing_block_worker_filter(uvm, seccompiler):
         num_queues=1,
     )
 
-    with pytest.raises(RuntimeError, match="Missing block worker seccomp filter"):
+    with pytest.raises(
+        RuntimeError, match="No seccomp filter for thread category: blk_worker"
+    ):
         test_microvm.start()
 
 

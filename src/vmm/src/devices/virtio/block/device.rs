@@ -14,9 +14,10 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::queue::QueueConfig;
 use crate::devices::virtio::transport::VirtioInterrupt;
+use crate::devices::virtio::worker::WorkerError;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
-use crate::seccomp::BpfProgram;
+use crate::seccomp::{BpfThreadMap, thread_filter};
 use crate::snapshot::Persist;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -106,19 +107,6 @@ impl Block {
         match self {
             Self::Virtio(_) => false,
             Self::VhostUser(_) => true,
-        }
-    }
-
-    pub(crate) fn spawn_worker(
-        &mut self,
-        seccomp_filter: Option<Arc<BpfProgram>>,
-    ) -> Result<(), BlockError> {
-        match self {
-            // A set `num_queues` means the block device runs on worker threads.
-            Self::Virtio(b) if b.config.num_queues.is_some() => b
-                .spawn_workers(&seccomp_filter.ok_or(BlockError::MissingSeccompFilter)?)
-                .map_err(|err| BlockError::VirtioBackend(err.into())),
-            Self::Virtio(_) | Self::VhostUser(_) => Ok(()),
         }
     }
 }
@@ -262,6 +250,16 @@ impl VirtioDevice for Block {
             Self::VhostUser(b) => b.prepare_save(),
         }
     }
+
+    fn spawn_workers(&mut self, seccomp_filters: &BpfThreadMap) -> Result<(), WorkerError> {
+        match self {
+            // A set `num_queues` means the block device runs on worker threads.
+            Self::Virtio(b) if b.config.num_queues.is_some() => {
+                b.spawn_workers(thread_filter(seccomp_filters, "blk_worker")?)
+            }
+            Self::Virtio(_) | Self::VhostUser(_) => Ok(()),
+        }
+    }
 }
 
 impl MutEventSubscriber for Block {
@@ -315,18 +313,24 @@ mod tests {
     use crate::devices::virtio::block::virtio::test_utils::default_block;
 
     #[test]
-    fn test_spawn_worker_filter() {
+    fn test_spawn_workers_filter() {
+        // Worker categories are optional in a custom filter file, so a map without `blk_worker`
+        // is valid for an inline drive and a configuration error for a threaded one.
+        let no_worker_filter = BpfThreadMap::new();
+
         let mut inline = Block::Virtio(default_block(FileEngineType::Sync));
-        inline.spawn_worker(None).unwrap();
+        inline.spawn_workers(&no_worker_filter).unwrap();
 
         let mut threaded = default_block(FileEngineType::Sync);
         threaded.config.num_queues = std::num::NonZeroU16::new(1);
         let mut threaded = Block::Virtio(threaded);
 
         assert!(matches!(
-            threaded.spawn_worker(None),
-            Err(BlockError::MissingSeccompFilter)
+            threaded.spawn_workers(&no_worker_filter),
+            Err(WorkerError::MissingFilter(_))
         ));
-        threaded.spawn_worker(Some(Arc::new(vec![]))).unwrap();
+        threaded
+            .spawn_workers(&crate::seccomp::get_empty_filters())
+            .unwrap();
     }
 }

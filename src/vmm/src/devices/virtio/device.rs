@@ -18,7 +18,9 @@ use super::transport::VirtioInterrupt;
 use crate::MutEventSubscriber;
 use crate::devices::virtio::AsAny;
 use crate::devices::virtio::generated::virtio_ids;
+use crate::devices::virtio::worker::WorkerError;
 use crate::logger::{error, info, warn};
+use crate::seccomp::BpfThreadMap;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -282,6 +284,22 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
+
+    /// Spawns this device's queue-group worker threads, if it is configured for threaded mode.
+    ///
+    /// Called for every virtio device by the device manager, wherever it attaches one: at boot, on
+    /// hotplug and on snapshot restore, always before activation. The threads park until
+    /// [`VirtioDevice::activate`] hands them their resources.
+    ///
+    /// The seccomp filters are an argument rather than a settable field so that a worker thread
+    /// cannot end up unfiltered because a setter was forgotten.
+    ///
+    /// The whole filter map is passed, not one filter: worker categories are optional in a custom
+    /// filter file, so a device looks its category up only if it is actually threaded. A missing
+    /// filter for a threaded device is then a configuration error, never an unfiltered thread.
+    fn spawn_workers(&mut self, _seccomp_filters: &BpfThreadMap) -> Result<(), WorkerError> {
+        Ok(())
+    }
 }
 
 impl fmt::Debug for dyn VirtioDevice {

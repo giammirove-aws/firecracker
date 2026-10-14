@@ -74,6 +74,4 @@ pub enum VirtioBlockError {
     RateLimiter(std::io::Error),
     /// Persistence error: {0}
     Persist(crate::devices::virtio::persist::PersistError),
-    /// Block worker thread error: {0}
-    Worker(#[from] crate::devices::virtio::worker::WorkerError),
 }

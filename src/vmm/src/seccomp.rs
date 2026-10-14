@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
+use crate::devices::virtio::worker::WorkerError;
+
 // This byte limit is passed to `bitcode` to guard against a potential memory
 // allocation DOS caused by binary filters that are too large.
 // This limit can be safely determined since the maximum length of a BPF
@@ -34,6 +36,20 @@ pub enum DeserializationError {
     SizeLimitExceeded(usize, usize),
     /// Bitcode deserialization failed: {0}
     Bitcode(#[from] bitcode::Error),
+}
+
+/// Looks up the seccomp filter a thread must install, by thread category.
+///
+/// `filter_thread_categories` rejects an incomplete filter map long before a device is built, so
+/// this cannot fail in practice — but it returns a typed error rather than panicking, because a
+/// missing filter would otherwise silently leave a thread unfiltered.
+pub fn thread_filter<'a>(
+    filters: &'a BpfThreadMap,
+    category: &str,
+) -> Result<&'a Arc<BpfProgram>, WorkerError> {
+    filters
+        .get(category)
+        .ok_or_else(|| WorkerError::MissingFilter(category.to_string()))
 }
 
 /// Retrieve empty seccomp filters.

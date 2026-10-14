@@ -33,11 +33,12 @@ use crate::devices::virtio::vsock::persist::{
     VsockConstructorArgs, VsockState, VsockUdsConstructorArgs,
 };
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::worker::WorkerError;
 use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciBusError;
 use crate::resources::VmResources;
-use crate::seccomp::BpfProgram;
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::machine_config::MAX_PCIE_HOTPLUG_PORTS;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -91,6 +92,8 @@ pub enum PciManagerError {
     /// The snapshot's PCIe root port at index {0} is inconsistent: it is at
     /// {1} and starts bus {2}.
     InconsistentRootPort(usize, PciSBDF, u8),
+    /// Failed to spawn the device's worker threads: {0}
+    SpawnWorker(#[from] WorkerError),
 }
 
 impl PciDevices {
@@ -305,8 +308,14 @@ impl PciDevices {
         device_id: &str,
         transport_state: &VirtioPciDeviceState,
         event_manager: &mut EventManager,
+        seccomp_filters: &BpfThreadMap,
     ) -> Result<(), PciManagerError> {
-        let device_type = device.lock().expect("Poisoned lock").device_type();
+        let device_type = {
+            let mut locked = device.lock().expect("Poisoned lock");
+            // Every device gets its worker threads here, before its transport can activate it.
+            locked.spawn_workers(seccomp_filters)?;
+            locked.device_type()
+        };
 
         let virtio_device = Arc::new(Mutex::new(VirtioPciDevice::new_from_state(
             device_id.to_string(),
@@ -418,7 +427,7 @@ pub struct PciDevicesConstructorArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub event_manager: &'a mut EventManager,
-    pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    pub seccomp_filters: Arc<BpfThreadMap>,
 }
 
 impl<'a> Debug for PciDevicesConstructorArgs<'a> {
@@ -620,6 +629,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -628,11 +638,6 @@ impl<'a> Persist<'a> for PciDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
-
-            device
-                .lock()
-                .expect("Poisoned lock")
-                .spawn_worker(constructor_args.blk_worker_filter.clone())?;
 
             constructor_args
                 .vm_resources
@@ -645,6 +650,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &block_state.device_id,
                 &block_state.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -691,6 +697,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &net_state.device_id,
                 &net_state.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -718,6 +725,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -740,6 +748,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -764,6 +773,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -784,6 +794,7 @@ impl<'a> Persist<'a> for PciDevices {
                 &memory_device.device_id,
                 &memory_device.transport_state,
                 constructor_args.event_manager,
+                &constructor_args.seccomp_filters,
             )?
         }
 
@@ -952,7 +963,7 @@ mod tests {
             vm_resources,
             instance_id: "microvm-id",
             event_manager: &mut event_manager,
-            blk_worker_filter: None,
+            seccomp_filters: Arc::new(crate::seccomp::get_empty_filters()),
         };
         let _restored_dev_manager = PciDevices::restore(restore_args, pci_state).unwrap();
 
@@ -1132,7 +1143,7 @@ mod tests {
                 vm_resources: &mut VmResources::default(),
                 instance_id: "microvm-id",
                 event_manager: &mut event_manager,
-                blk_worker_filter: None,
+                seccomp_filters: Arc::new(crate::seccomp::get_empty_filters()),
             },
             pci_state,
         )

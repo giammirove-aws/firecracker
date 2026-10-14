@@ -38,7 +38,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
-use crate::seccomp::BpfProgram;
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -138,7 +138,7 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
-    pub blk_worker_filter: Option<Arc<BpfProgram>>,
+    pub seccomp_filters: Arc<BpfThreadMap>,
 }
 
 pub struct MMIOPlatformDevicesConstructorArgs<'a> {
@@ -432,6 +432,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         let mut dev_manager = MMIOVirtioDevices::new();
         let mem = constructor_args.mem;
         let vm = constructor_args.vm;
+        let seccomp_filters = constructor_args.seccomp_filters.clone();
 
         let mut restore_helper = |device: Arc<Mutex<dyn VirtioDevice>>,
                                   activated: bool,
@@ -441,6 +442,12 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                                   device_info: &MMIODeviceInfo,
                                   event_manager: &mut EventManager|
          -> Result<(), Self::Error> {
+            // Every device gets its worker threads here, before it can be activated.
+            device
+                .lock()
+                .expect("Poisoned lock")
+                .spawn_workers(&seccomp_filters)?;
+
             let interrupt = Arc::new(IrqTrigger::new());
             let restore_args = MmioTransportConstructorArgs {
                 mem: mem.clone(),
@@ -505,11 +512,6 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
-
-            device
-                .lock()
-                .expect("Poisoned lock")
-                .spawn_worker(constructor_args.blk_worker_filter.clone())?;
 
             constructor_args
                 .vm_resources
@@ -950,7 +952,7 @@ mod tests {
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
-            blk_worker_filter: None,
+            seccomp_filters: Arc::new(crate::seccomp::get_empty_filters()),
         };
         let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 

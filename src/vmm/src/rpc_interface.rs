@@ -224,6 +224,8 @@ pub enum VmmActionError {
     PciNotEnabled,
     /// PCI manager error: {0}
     PciManager(#[from] PciManagerError),
+    /// Device worker error: {0}
+    Worker(#[from] crate::devices::virtio::worker::WorkerError),
 }
 
 /// The enum represents the response sent by the VMM in case of success. The response is either

@@ -52,6 +52,8 @@ pub enum WorkerError {
     Disconnected,
     /// Failed to notify a queue group worker: {0}
     Notify(#[from] std::io::Error),
+    /// No seccomp filter for thread category: {0}
+    MissingFilter(String),
 }
 
 /// Tokens at or above this belong to a device's inline worker, registered on the VMM event loop
