@@ -37,7 +37,7 @@ impl VirtioBlock {
 
     fn register_rate_limiter_event(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
-            &*self.lock_rate_limiter(),
+            &*self.rate_limiter.lock(),
             Self::PROCESS_RATE_LIMITER,
             EventSet::IN,
         )) {
@@ -111,7 +111,7 @@ impl MutEventSubscriber for VirtioBlock {
                 }
                 Self::PROCESS_QUEUE => self.drain_queue_events(),
                 Self::PROCESS_RATE_LIMITER => {
-                    let _ = self.lock_rate_limiter().event_handler();
+                    let _ = self.rate_limiter.lock().event_handler();
                 }
                 Self::PROCESS_ASYNC_COMPLETION => {
                     let resources = self.resources();

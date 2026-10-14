@@ -3,8 +3,8 @@
 
 use std::fmt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -333,7 +333,8 @@ pub struct RateLimiter {
     // because `Self::update_buckets()` might re-enable it later, and we might be
     // seccomp-blocked from creating the timer_fd at that time.
     timer_fd: TimerFd,
-    // Internal flag that quickly determines timer state.
+    // Internal flag that quickly determines timer state. Shared so that a worker thread can
+    // observe the blocked state without taking a lock on the limiter itself.
     timer_active: Arc<AtomicBool>,
 }
 
@@ -513,7 +514,8 @@ impl RateLimiter {
     pub fn is_blocked(&self) -> bool {
         self.timer_active.load(Ordering::Relaxed)
     }
-    /// Clones the shared blocked-state flag for lock free checks
+
+    /// Clones the shared blocked-state flag so it can be checked without locking the limiter.
     pub(crate) fn clone_blocked_flag(&self) -> Arc<AtomicBool> {
         self.timer_active.clone()
     }
@@ -558,6 +560,12 @@ impl RateLimiter {
     pub fn ops(&self) -> Option<&TokenBucket> {
         self.ops.as_ref()
     }
+
+    /// Whether any token type is limited. Without a bucket there is nothing to charge or
+    /// replenish.
+    fn has_buckets(&self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
 }
 
 impl AsRawFd for RateLimiter {
@@ -576,6 +584,64 @@ impl Default for RateLimiter {
     /// Default RateLimiter is a no-op limiter with infinite budget.
     fn default() -> Self {
         RateLimiter::new(0, 0, 0, 0, 0, 0)
+    }
+}
+
+/// A rate limiter shared between the VMM thread and a device worker thread.
+///
+/// The VMM thread owns the timerfd and services its unblock events; the worker thread charges
+/// tokens against the buckets. The lock is therefore taken once per frame on the data path, but
+/// only while a limit is set: without any bucket there is nothing to charge, and a relaxed load of
+/// a flag kept in step with the buckets tells the data path so without the lock. The far more
+/// frequent "am I throttled?" check that runs on every epoll wake is likewise a relaxed atomic load
+/// on a flag shared with the limiter, so it never touches the lock either.
+///
+/// One limiter per device shared by its workers is deliberate: splitting the configured budget
+/// across N per-queue limiters would be lock free, but a single-threaded guest workload would then
+/// see `1/N` of its configured bandwidth, which is a worse outcome than a rarely contended lock.
+#[derive(Debug, Clone)]
+pub struct SharedRateLimiter {
+    limiter: Arc<Mutex<RateLimiter>>,
+    blocked: Arc<AtomicBool>,
+    /// Whether the limiter has any bucket. Written under the lock by every change of the buckets
+    /// made through this type, which is every change: a worker that reads it stale while a limit
+    /// is added only lets that one frame through uncharged.
+    limited: Arc<AtomicBool>,
+}
+
+impl SharedRateLimiter {
+    /// Wraps `limiter` so it can be shared with a worker thread.
+    pub fn new(limiter: RateLimiter) -> Self {
+        let blocked = limiter.clone_blocked_flag();
+        let limited = Arc::new(AtomicBool::new(limiter.has_buckets()));
+        Self {
+            limiter: Arc::new(Mutex::new(limiter)),
+            blocked,
+            limited,
+        }
+    }
+
+    /// Returns whether the limiter ran out of budget, without taking the lock.
+    pub fn is_blocked(&self) -> bool {
+        self.blocked.load(Ordering::Relaxed)
+    }
+
+    /// Locks the limiter.
+    pub fn lock(&self) -> MutexGuard<'_, RateLimiter> {
+        self.limiter.lock().expect("Poisoned rate limiter lock")
+    }
+
+    /// Locks the limiter so tokens can be charged against it, unless it has no bucket: then there
+    /// is nothing to charge, and `None` is returned without touching the lock.
+    pub fn lock_if_limited(&self) -> Option<MutexGuard<'_, RateLimiter>> {
+        self.limited.load(Ordering::Relaxed).then(|| self.lock())
+    }
+
+    /// Updates the buckets, and with them whether the data path has anything to charge.
+    pub fn update_buckets(&self, bytes: BucketUpdate, ops: BucketUpdate) {
+        let mut guard = self.lock();
+        guard.update_buckets(bytes, ops);
+        self.limited.store(guard.has_buckets(), Ordering::Relaxed);
     }
 }
 
@@ -1002,6 +1068,57 @@ pub(crate) mod tests {
             "{:?}",
             err
         );
+    }
+
+    #[test]
+    fn test_shared_rate_limiter_blocked_flag() {
+        // One op per second, so the second op in the same second must block the limiter.
+        let shared = SharedRateLimiter::new(RateLimiter::new(0, 0, 0, 1, 0, 1000));
+        // A clone stands in for the copy a worker thread is handed.
+        let worker_view = shared.clone();
+
+        assert!(!worker_view.is_blocked());
+        assert!(shared.lock().consume(1, TokenType::Ops));
+        assert!(!worker_view.is_blocked());
+
+        assert!(!shared.lock().consume(1, TokenType::Ops));
+        // The blocked state is visible through the clone without locking.
+        assert!(worker_view.is_blocked());
+    }
+
+    #[test]
+    fn test_shared_rate_limiter_unlimited_never_locks() {
+        let shared = SharedRateLimiter::new(RateLimiter::default());
+        let worker_view = shared.clone();
+        // Hold the lock: a data path that tried to take it would block, and miss the deadline.
+        let _guard = shared.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(worker_view.lock_if_limited().is_none()).unwrap());
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+
+    #[test]
+    fn test_shared_rate_limiter_toggled_at_runtime() {
+        let shared = SharedRateLimiter::new(RateLimiter::default());
+        let worker_view = shared.clone();
+        assert!(worker_view.lock_if_limited().is_none());
+
+        // A limit added through the API is charged from the next frame on: one op per second.
+        let ops = TokenBucket::new(1, 0, 1000).unwrap();
+        shared.update_buckets(BucketUpdate::None, BucketUpdate::Update(ops));
+        let mut limiter = worker_view.lock_if_limited().unwrap();
+        assert!(limiter.consume(1, TokenType::Ops));
+        assert!(!limiter.consume(1, TokenType::Ops));
+        drop(limiter);
+        assert!(worker_view.is_blocked());
+
+        // Removing the bytes limit alone keeps the ops one charged.
+        shared.update_buckets(BucketUpdate::Disabled, BucketUpdate::None);
+        assert!(worker_view.lock_if_limited().is_some());
+
+        // Removing every limit stops the charging.
+        shared.update_buckets(BucketUpdate::None, BucketUpdate::Disabled);
+        assert!(worker_view.lock_if_limited().is_none());
     }
 
     #[test]
