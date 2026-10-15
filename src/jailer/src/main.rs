@@ -48,6 +48,8 @@ pub enum JailerError {
          cgroup under {0}, pass any --cgroup parameters."
     )]
     CgroupMove(PathBuf, io::Error),
+    #[error("Failed to create the microVM process in cgroup {0}: {1}")]
+    CgroupClone(PathBuf, io::Error),
     #[error("Failed to change owner for {0}: {1}")]
     ChangeFileOwner(PathBuf, io::Error),
     #[error("Failed to chdir into chroot directory: {0}")]

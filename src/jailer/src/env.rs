@@ -104,6 +104,113 @@ fn clone(child_stack: *mut libc::c_void, flags: libc::c_int) -> Result<libc::c_i
     .map_err(JailerError::Clone)
 }
 
+// `clone3` arguments, as defined by `struct clone_args` in the kernel UAPI (`linux/sched.h`).
+// The libc crate doesn't provide it for every target.
+#[repr(C)]
+#[derive(Debug, Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+// Linux 5.7+, `linux/sched.h`.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+// The low byte of the legacy `clone` flags holds the exit signal.
+const CSIGNAL: libc::c_int = 0xff;
+
+// Builds the error reported when the process can't be created in, or moved into, a cgroup.
+type CgroupError = fn(PathBuf, io::Error) -> JailerError;
+
+// A cgroup v2 directory, opened before chrooting, that the process which execs the binary is
+// created in. Creating a process inside its cgroup with `clone3(CLONE_INTO_CGROUP)` avoids
+// moving the jailer through `cgroup.procs`, which waits for an RCU grace period (tens of ms).
+#[derive(Debug)]
+struct CgroupDir {
+    path: PathBuf,
+    dir: File,
+    procs: File,
+    error: CgroupError,
+}
+
+impl CgroupDir {
+    fn open(path: &Path, error: CgroupError) -> Result<Self, JailerError> {
+        // std opens files with O_CLOEXEC, so neither fd can leak into the exec-ed binary.
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(path)
+            .map_err(|err| JailerError::FileOpen(path.to_path_buf(), err))?;
+        let procs_path = path.join("cgroup.procs");
+        let procs = OpenOptions::new()
+            .write(true)
+            .open(&procs_path)
+            .map_err(|err| JailerError::FileOpen(procs_path, err))?;
+        Ok(CgroupDir {
+            path: path.to_path_buf(),
+            dir,
+            procs,
+            error,
+        })
+    }
+}
+
+// Like `clone`, but when `cgroup_dir` is given the child is created inside that cgroup. On
+// kernels without `clone3` or `CLONE_INTO_CGROUP`, the calling process moves into the cgroup
+// first and then clones, so the child still starts there. The cgroup fds are closed on return
+// in both the parent and the child.
+fn clone_into_cgroup(
+    flags: libc::c_int,
+    cgroup_dir: Option<CgroupDir>,
+) -> Result<libc::c_int, JailerError> {
+    let Some(cgroup_dir) = cgroup_dir else {
+        return clone(std::ptr::null_mut(), flags);
+    };
+
+    let args = CloneArgs {
+        // Bit-preserving casts: the flags are non-negative and the fd is valid.
+        flags: u64::try_from(flags & !CSIGNAL).unwrap() | CLONE_INTO_CGROUP,
+        exit_signal: u64::try_from(flags & CSIGNAL).unwrap(),
+        cgroup: u64::try_from(cgroup_dir.dir.as_raw_fd()).unwrap(),
+        ..Default::default()
+    };
+    // SAFETY: `args` is a valid `clone_args` of the size we pass. Without CLONE_VM and with a
+    // NULL stack, `clone3` duplicates the process like `fork`, which is sound because the jailer
+    // is single-threaded.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &args as *const CloneArgs,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if ret >= 0 {
+        // Unwrap is safe because PIDs are 32-bit.
+        return Ok(libc::c_int::try_from(ret).unwrap());
+    }
+
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // No `clone3` (ENOSYS), unknown flag (EINVAL) or larger `clone_args` (E2BIG).
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::E2BIG) => {
+            // Writing 0 moves the writing process.
+            (&cgroup_dir.procs)
+                .write_all(b"0")
+                .map_err(|err| (cgroup_dir.error)(cgroup_dir.path.clone(), err))?;
+            clone(std::ptr::null_mut(), flags)
+        }
+        _ => Err((cgroup_dir.error)(cgroup_dir.path, err)),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum UserfaultfdParseError {
     #[error("Could not read /proc/misc: {0}")]
@@ -129,6 +236,9 @@ pub struct Env {
     jailer_cpu_time_us: u64,
     extra_args: Vec<String>,
     cgroup_conf: Option<CgroupConfiguration>,
+    // cgroup v2 directory the cloned process is created in, when the jailer clones before exec,
+    // and the error to report if that fails.
+    cgroup_target: Option<(PathBuf, CgroupError)>,
     resource_limits: ResourceLimits,
     uffd_dev_minor: Option<u32>,
 }
@@ -234,13 +344,20 @@ impl Env {
         // If the --parent-cgroup exists, and we have no other cgroups,
         // then the intent is to move the process to that cgroup.
         // Only applies to cgroupsv2 since it's a unified hierarchy
+        let mut cgroup_target: Option<(PathBuf, CgroupError)> = None;
         if cgroups_args.is_empty() && cgroup_ver == 2 {
             let builder = CgroupConfigurationBuilder::new(cgroup_ver, proc_mounts)?;
             let cg_parent = builder.get_v2_hierarchy_path()?.join(parent_cgroup);
             let cg_parent_procs = cg_parent.join("cgroup.procs");
             if cg_parent.exists() {
-                fs::write(cg_parent_procs, std::process::id().to_string())
-                    .map_err(|_| JailerError::CgroupMove(cg_parent, io::Error::last_os_error()))?;
+                if daemonize || new_pid_ns {
+                    // The jailer clones before exec, so the clone is created in the cgroup.
+                    cgroup_target = Some((cg_parent, JailerError::CgroupMove));
+                } else {
+                    fs::write(cg_parent_procs, std::process::id().to_string()).map_err(|_| {
+                        JailerError::CgroupMove(cg_parent, io::Error::last_os_error())
+                    })?;
+                }
             }
         }
 
@@ -290,6 +407,7 @@ impl Env {
             jailer_cpu_time_us: 0,
             extra_args: arguments.extra_args(),
             cgroup_conf,
+            cgroup_target,
             resource_limits,
             uffd_dev_minor,
         })
@@ -347,7 +465,11 @@ impl Env {
         Ok(())
     }
 
-    fn exec_into_new_pid_ns(&mut self, chroot_exec_file: PathBuf) -> Result<(), JailerError> {
+    fn exec_into_new_pid_ns(
+        &mut self,
+        chroot_exec_file: PathBuf,
+        cgroup_dir: Option<CgroupDir>,
+    ) -> Result<(), JailerError> {
         // https://man7.org/linux/man-pages/man7/pid_namespaces.7.html
         // > a process in an ancestor namespace can send signals to the "init" process of a child
         // > PID namespace only if the "init" process has established a handler for that signal.
@@ -383,7 +505,7 @@ impl Env {
         // Duplicate the current process. The child process will belong to the previously created
         // PID namespace. The current process will not be moved into the newly created namespace,
         // but its first child will assume the role of init(1) in the new namespace.
-        let pid = clone(std::ptr::null_mut(), libc::CLONE_NEWPID)?;
+        let pid = clone_into_cgroup(libc::CLONE_NEWPID, cgroup_dir)?;
         match pid {
             0 => {
                 if is_session_leader {
@@ -656,9 +778,22 @@ impl Env {
         self.resource_limits.install()?;
 
         // We have to setup cgroups at this point, because we can't do it anymore after chrooting.
+        // If the jailer clones before exec (--daemonize or --new-pid-ns) with cgroups v2, the
+        // clone is created in the cgroup instead of the jailer moving into it.
         if let Some(ref conf) = self.cgroup_conf {
-            conf.setup()?;
+            match conf.v2_location() {
+                Some(location) if self.daemonize || self.new_pid_ns => {
+                    conf.write_values()?;
+                    self.cgroup_target = Some((location.to_path_buf(), JailerError::CgroupClone));
+                }
+                _ => conf.setup()?,
+            }
         }
+        let mut cgroup_dir = self
+            .cgroup_target
+            .as_ref()
+            .map(|(path, error)| CgroupDir::open(path, *error))
+            .transpose()?;
 
         // If daemonization was requested, open /dev/null before chrooting.
         let dev_null = if self.daemonize {
@@ -721,8 +856,11 @@ impl Env {
             // setsid() will fail if the calling process is a process group leader.
             // By calling fork(), we guarantee that the newly created process inherits
             // the PGID from its parent and, therefore, is not a process group leader.
-            // SAFETY: Safe because it's a library function.
-            let child_pid = unsafe { libc::fork() };
+            let child_pid = match cgroup_dir.take() {
+                Some(cgroup_dir) => clone_into_cgroup(libc::SIGCHLD, Some(cgroup_dir))?,
+                // SAFETY: Safe because it's a library function.
+                None => unsafe { libc::fork() },
+            };
             if child_pid < 0 {
                 return Err(JailerError::Daemonize(io::Error::last_os_error()));
             }
@@ -769,7 +907,7 @@ impl Env {
 
         // If specified, exec the provided binary into a new PID namespace.
         if self.new_pid_ns {
-            self.exec_into_new_pid_ns(chroot_exec_file)
+            self.exec_into_new_pid_ns(chroot_exec_file, cgroup_dir)
         } else {
             self.save_exec_file_pid(id().try_into().unwrap(), chroot_exec_file.clone())?;
             Err(JailerError::Exec(self.exec_command(chroot_exec_file)))
@@ -1451,6 +1589,111 @@ mod tests {
         fs::metadata(&index_dest_path).unwrap();
         let entries = fs::read_dir(&index_dest_path).unwrap();
         assert_eq!(entries.enumerate().count(), 6);
+    }
+
+    // Runs `f` on a new thread whose seccomp filter makes `clone3` fail with ENOSYS, as it does
+    // on kernels without `clone3`. The filter goes away with the thread.
+    fn with_clone3_enosys<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            let stmt = |code: u32, k: u32| libc::sock_filter {
+                code: u16::try_from(code).unwrap(),
+                jt: 0,
+                jf: 0,
+                k,
+            };
+            let filter = [
+                // Load the syscall number, the first field of `struct seccomp_data`.
+                stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0),
+                libc::sock_filter {
+                    code: u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K).unwrap(),
+                    jt: 0,
+                    jf: 1,
+                    k: u32::try_from(libc::SYS_clone3).unwrap(),
+                },
+                stmt(
+                    libc::BPF_RET | libc::BPF_K,
+                    libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS).unwrap(),
+                ),
+                stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
+            ];
+            let prog = libc::sock_fprog {
+                len: u16::try_from(filter.len()).unwrap(),
+                filter: filter.as_ptr().cast_mut(),
+            };
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) },
+                0
+            );
+            f()
+        })
+        .join()
+        .unwrap()
+    }
+
+    fn wait_child_success(pid: libc::c_int) {
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn test_clone_into_cgroup_fallback() {
+        // Without clone3, the calling process moves into the cgroup (writing 0 to cgroup.procs
+        // moves the writer), then clones.
+        let cgroup = TempDir::new().unwrap();
+        let path = cgroup.as_path().to_path_buf();
+        let procs = path.join("cgroup.procs");
+        File::create(&procs).unwrap();
+
+        let pid = with_clone3_enosys(move || {
+            let cgroup_dir = CgroupDir::open(&path, JailerError::CgroupClone).unwrap();
+            let pid = clone_into_cgroup(libc::SIGCHLD, Some(cgroup_dir)).unwrap();
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            pid
+        });
+        wait_child_success(pid);
+        assert_eq!(fs::read_to_string(&procs).unwrap(), "0");
+    }
+
+    #[test]
+    fn test_clone_into_cgroup_reports_errors() {
+        // clone3 rejects a directory that isn't a cgroup with EBADF. That isn't a missing
+        // feature, so the jailer must report it rather than fall back.
+        let not_cgroup = TempDir::new().unwrap();
+        let path = not_cgroup.as_path().to_path_buf();
+        let procs = path.join("cgroup.procs");
+        File::create(&procs).unwrap();
+
+        let cgroup_dir = CgroupDir::open(&path, JailerError::CgroupClone).unwrap();
+        match clone_into_cgroup(libc::SIGCHLD, Some(cgroup_dir)) {
+            Ok(0) => unsafe { libc::_exit(0) },
+            Ok(pid) => {
+                wait_child_success(pid);
+                panic!("clone3 into a non-cgroup directory succeeded");
+            }
+            Err(JailerError::CgroupClone(err_path, err)) => {
+                assert_eq!(err_path, path);
+                assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+            }
+            Err(err) => panic!("unexpected error: {err}"),
+        }
+        assert_eq!(fs::read_to_string(&procs).unwrap(), "");
+    }
+
+    #[test]
+    fn test_clone_into_cgroup_without_cgroup() {
+        let pid = clone_into_cgroup(libc::SIGCHLD, None).unwrap();
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        wait_child_success(pid);
     }
 
     #[test]

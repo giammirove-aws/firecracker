@@ -23,6 +23,12 @@ and this project adheres to
 
 ### Changed
 
+- With cgroups v2 and `--daemonize` or `--new-pid-ns`, the jailer now creates
+  the process that execs Firecracker directly in the microVM cgroup with
+  `clone3(CLONE_INTO_CGROUP)`, instead of moving itself there through
+  `cgroup.procs`. The move waits for an RCU grace period, so this removes about
+  10-20 ms from each jailed start and snapshot restore. Kernels without
+  `CLONE_INTO_CGROUP` keep the previous behaviour.
 - [#2046](https://github.com/firecracker-microvm/firecracker/issues/2046): The
   PL061 GPIO controller backing the new aarch64 power button is always attached
   and uses one extra GSI, which reduces the GSIs left for VirtIO devices. The

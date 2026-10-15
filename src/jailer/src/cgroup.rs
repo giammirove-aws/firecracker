@@ -238,6 +238,22 @@ impl CgroupConfiguration {
             Self::V2(conf) => setup_cgroup_conf(conf),
         }
     }
+
+    // Writes the cgroup property values without moving the jailer into the cgroups.
+    pub fn write_values(&self) -> Result<(), JailerError> {
+        match self {
+            Self::V1(conf) => write_cgroup_values(conf),
+            Self::V2(conf) => write_cgroup_values(conf),
+        }
+    }
+
+    // Returns the microVM cgroup directory when using cgroups v2, which has a single hierarchy.
+    pub fn v2_location(&self) -> Option<&Path> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(conf) => conf.values().next().map(|cg| cg.base.location.as_path()),
+        }
+    }
 }
 
 // If we call inherit_from_parent_aux(.../A/B/C, file, condition), the following will happen:
@@ -485,12 +501,17 @@ impl Cgroup for CgroupV2 {
     }
 }
 
-pub fn setup_cgroup_conf(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
-    // cgroups are iterated two times as some cgroups may require others (e.g cpuset requires
-    // cpuset.mems and cpuset.cpus) to be set before attaching any pid.
+fn write_cgroup_values(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
     for cgroup in conf.values() {
         cgroup.write_values()?;
     }
+    Ok(())
+}
+
+pub fn setup_cgroup_conf(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
+    // cgroups are iterated two times as some cgroups may require others (e.g cpuset requires
+    // cpuset.mems and cpuset.cpus) to be set before attaching any pid.
+    write_cgroup_values(conf)?;
     for cgroup in conf.values() {
         cgroup.attach_pid()?;
     }
@@ -832,6 +853,59 @@ mod tests {
                 .unwrap()
                 .contains("cpuset")
         );
+    }
+
+    #[test]
+    fn test_cgroup_conf_v2_write_values_without_attach() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v2_mounts().unwrap();
+        let mut builder =
+            CgroupConfigurationBuilder::new(2, mock_cgroups.proc_mounts_path.to_str().unwrap())
+                .unwrap();
+        builder
+            .add_cgroup_property(
+                "cpuset.mems".to_string(),
+                "1".to_string(),
+                "101",
+                Path::new("fc_test_cgv2"),
+            )
+            .unwrap();
+        let cg_conf = builder.build();
+        let cg_jail = mock_cgroups
+            .sys_cgroups_path
+            .join("unified/fc_test_cgv2/101");
+
+        assert_eq!(cg_conf.v2_location(), Some(cg_jail.as_path()));
+
+        fs::create_dir_all(&cg_jail).unwrap();
+        MockCgroupFs::create_file_with_contents(
+            cg_jail.parent().unwrap().join("cgroup.subtree_control"),
+            "",
+        )
+        .unwrap();
+        cg_conf.write_values().unwrap();
+
+        // The value is written, but no pid is: the caller creates the process in the cgroup.
+        assert_eq!(read_first_line(cg_jail.join("cpuset.mems")).unwrap(), "1\n");
+        assert!(!cg_jail.join("cgroup.procs").exists());
+    }
+
+    #[test]
+    fn test_cgroup_conf_v1_has_no_v2_location() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v1_mounts().unwrap();
+        let mut builder =
+            CgroupConfigurationBuilder::new(1, mock_cgroups.proc_mounts_path.to_str().unwrap())
+                .unwrap();
+        builder
+            .add_cgroup_property(
+                "cpuset.mems".to_string(),
+                "1".to_string(),
+                "101",
+                Path::new("fc_test_cgv1"),
+            )
+            .unwrap();
+        assert_eq!(builder.build().v2_location(), None);
     }
 
     #[test]

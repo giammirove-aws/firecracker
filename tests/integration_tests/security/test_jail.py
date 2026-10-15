@@ -426,6 +426,31 @@ def test_cgroups(uvm, cgroups_info):
 
 
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("daemonize", [True, False])
+@pytest.mark.parametrize("new_pid_ns", [True, False])
+def test_cgroups_v2_jailer_modes(uvm, cgroups_info, daemonize, new_pid_ns):
+    """
+    Test that Firecracker runs in its cgroup in every jailer process mode.
+
+    With --daemonize or --new-pid-ns, Firecracker is created in the cgroup with
+    clone3(CLONE_INTO_CGROUP); otherwise the jailer moves itself into it.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = daemonize
+    test_microvm.jailer.new_pid_ns = new_pid_ns
+    test_microvm.jailer.cgroups = ["cpu.weight.nice=10", "memory.max=1073741824"]
+    test_microvm.spawn()
+
+    check_cgroups_v2(test_microvm)
+    cg_jail = cgroups_info.root / FC_BINARY_NAME / test_microvm.jailer.jailer_id
+    fc_cgroup = Path(f"/proc/{test_microvm.firecracker_pid}/cgroup").read_text()
+    assert fc_cgroup.strip() == f"0::/{cg_jail.relative_to(cgroups_info.root)}"
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 def test_cgroups_custom_parent(uvm, cgroups_info):
     """
     Test cgroups when a custom parent cgroup is used.
@@ -788,7 +813,7 @@ def test_cgroupsv2_written_only_once(uvm, cgroups_info):
         "--syscall-times=ns",
         "-y",
         "-e",
-        "write,mkdir,mkdirat",
+        "write,mkdir,mkdirat,clone3",
         "-o",
         strace_output_path,
     ]
@@ -817,6 +842,16 @@ def test_cgroupsv2_written_only_once(uvm, cgroups_info):
         for line in strace_out
         if "write" in line and f"{uvm.id}/cgroup.procs" in line
     ]
+    # With --daemonize or --new-pid-ns, the jailer creates the process that execs Firecracker
+    # directly in the cgroup, instead of writing to cgroup.procs. strace shows the cgroup as a
+    # bare fd, so match the flag only.
+    clone_lines = [
+        line for line in strace_out if "clone3" in line and "CLONE_INTO_CGROUP" in line
+    ]
+    if uvm.jailer.daemonize or uvm.jailer.new_pid_ns:
+        assert len(write_lines) == 0
+        assert len(clone_lines) == 1
+        write_lines = clone_lines
     mkdir_lines = [
         line
         for line in strace_out

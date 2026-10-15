@@ -136,7 +136,12 @@ After starting, the Jailer goes through the following operations:
   identified location (referred to as `<cgroup_base>`), the jailer creates the
   `<cgroup_base>/<parent_cgroup>/<id>` subfolder, and writes the current pid to
   `<cgroup_base>/<parent_cgroup>/<id>/tasks`. Also, the value passed for each
-  `<cgroup_file>` is written to the file.
+  `<cgroup_file>` is written to the file. With cgroup v2 and `--daemonize` or
+  `--new-pid-ns`, the jailer does not move itself: the process it clones before
+  exec is created directly in the cgroup with `clone3(CLONE_INTO_CGROUP)`.
+  Moving a process between cgroups waits for an RCU grace period, which can
+  take tens of milliseconds. On kernels without `CLONE_INTO_CGROUP`, the jailer
+  moves itself into the cgroup right before cloning.
 - Call `unshare()` into a new mount namespace, use `pivot_root()` to switch the
   old system root mount point with a new one base in `<chroot_dir>`, switch the
   current working directory to the new root, unmount the old root mount point,
