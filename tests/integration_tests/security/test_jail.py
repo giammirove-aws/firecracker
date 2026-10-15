@@ -5,6 +5,7 @@
 import http.client as http_client
 import os
 import resource
+import shlex
 import stat
 import subprocess
 import time
@@ -428,8 +429,18 @@ def test_cgroups(uvm, cgroups_info):
 def trace_cgroup_attach(vm):
     """Trace how the jailer attaches to its cgroup. Returns the strace output path."""
     strace_output_path = Path(vm.path, "strace-attach.out")
+    # -D keeps the jailer as the direct child of the launcher: without --daemonize,
+    # the jailer is the session leader under `screen` and must stay so.
     vm.add_pre_cmd(
-        ["strace", "-y", "-e", "trace=write,clone3", "-o", str(strace_output_path)]
+        [
+            "strace",
+            "-D",
+            "-y",
+            "-e",
+            "trace=write,clone3",
+            "-o",
+            str(strace_output_path),
+        ]
     )
     return strace_output_path
 
@@ -509,6 +520,44 @@ def test_parent_cgroup_jailer_modes(uvm, cgroups_info, daemonize, new_pid_ns):
         test_microvm, cgroups_info, cgroups_info.root / parent_cgroup
     )
     check_cgroup_attach(test_microvm, strace_output_path)
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("parent_only", [False, True])
+def test_cgroups_v2_started_in_cgroup(uvm, cgroups_info, parent_only):
+    """
+    Test that, in default mode, the jailer doesn't write to cgroup.procs when the
+    caller started it inside its cgroup, e.g. with clone3(CLONE_INTO_CGROUP).
+
+    The write would wait for an RCU grace period even though the jailer is
+    already a member. Covers --cgroup and a pre-created --parent-cgroup.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = False
+    test_microvm.jailer.new_pid_ns = False
+    if parent_only:
+        cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
+        test_microvm.jailer.parent_cgroup = cgroup
+    else:
+        cgroup = f"{FC_BINARY_NAME}/{test_microvm.jailer.jailer_id}"
+        test_microvm.jailer.cgroups = ["cpu.weight.nice=10"]
+    cgroups_info.new_cgroup(cgroup)
+    procs = cgroups_info.root / cgroup / "cgroup.procs"
+
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    # Start the jailer inside its cgroup: an untraced shell moves itself there, then
+    # execs strace and the jailer. Without --daemonize the framework runs the command
+    # through `screen` and a shell, hence the quoting.
+    script = shlex.quote(f'echo 0 > {procs} && exec "$@"')
+    test_microvm.add_pre_cmd(["sh", "-c", script, "sh"])
+    test_microvm.spawn()
+
+    check_firecracker_cgroup(test_microvm, cgroups_info, cgroups_info.root / cgroup)
+    strace_out = strace_output_path.read_text(encoding="utf-8").splitlines()
+    assert not [line for line in strace_out if "/cgroup.procs>" in line], strace_out
 
 
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)

@@ -17,7 +17,7 @@ use utils::{arg_parser, validators};
 use vmm_sys_util::syscall::SyscallReturnCode;
 
 use crate::JailerError;
-use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder};
+use crate::cgroup::{CgroupConfiguration, CgroupConfigurationBuilder, contains_self};
 use crate::chroot::chroot;
 use crate::resource_limits::{FSIZE_ARG, NO_FILE_ARG, ResourceLimits};
 
@@ -353,7 +353,7 @@ impl Env {
                 if daemonize || new_pid_ns {
                     // The jailer clones before exec, so the clone is created in the cgroup.
                     cgroup_target = Some((cg_parent, JailerError::CgroupMove));
-                } else {
+                } else if !contains_self(&cg_parent) {
                     fs::write(cg_parent_procs, std::process::id().to_string()).map_err(|_| {
                         JailerError::CgroupMove(cg_parent, io::Error::last_os_error())
                     })?;

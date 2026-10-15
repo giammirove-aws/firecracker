@@ -492,6 +492,9 @@ impl Cgroup for CgroupV2 {
     }
 
     fn attach_pid(&self) -> Result<(), JailerError> {
+        if contains_self(&self.base.location) {
+            return Ok(());
+        }
         let pid = process::id();
         let location = &self.base.location.join("cgroup.procs");
 
@@ -499,6 +502,18 @@ impl Cgroup for CgroupV2 {
 
         Ok(())
     }
+}
+
+// Returns whether the calling process is already in the cgroup v2 at `location`, e.g. because
+// the caller created the jailer there with clone3(CLONE_INTO_CGROUP). Writing to cgroup.procs
+// waits for an RCU grace period even when the process is already a member, so the jailer skips
+// the write in that case. Reading the cgroup's own cgroup.procs identifies the cgroup exactly,
+// unlike comparing paths from /proc/self/cgroup, which are relative to the cgroup namespace.
+// Any read error returns false, and the caller writes as before.
+pub fn contains_self(location: &Path) -> bool {
+    let pid = process::id().to_string();
+    fs::read_to_string(location.join("cgroup.procs"))
+        .is_ok_and(|procs| procs.lines().any(|line| line == pid))
 }
 
 fn write_cgroup_values(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
@@ -888,6 +903,42 @@ mod tests {
         // The value is written, but no pid is: the caller creates the process in the cgroup.
         assert_eq!(read_first_line(cg_jail.join("cpuset.mems")).unwrap(), "1\n");
         assert!(!cg_jail.join("cgroup.procs").exists());
+    }
+
+    #[test]
+    fn test_contains_self() {
+        let dir = TempDir::new().unwrap();
+        let procs = dir.as_path().join("cgroup.procs");
+
+        // No cgroup.procs: not a member, so the caller writes as before.
+        assert!(!contains_self(dir.as_path()));
+
+        fs::write(&procs, "1\n23\n").unwrap();
+        assert!(!contains_self(dir.as_path()));
+
+        fs::write(&procs, format!("1\n{}\n23\n", process::id())).unwrap();
+        assert!(contains_self(dir.as_path()));
+    }
+
+    #[test]
+    fn test_cgroup_v2_attach_skips_when_member() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v2_mounts().unwrap();
+        let unified = mock_cgroups.sys_cgroups_path.join("unified");
+        let cg = CgroupV2::new("101", Path::new("fc_test_cgv2"), &unified).unwrap();
+        let procs = unified.join("fc_test_cgv2/101/cgroup.procs");
+        fs::create_dir_all(procs.parent().unwrap()).unwrap();
+
+        // Already a member: nothing is written.
+        let member = format!("{}\n", process::id());
+        fs::write(&procs, &member).unwrap();
+        cg.attach_pid().unwrap();
+        assert_eq!(fs::read_to_string(&procs).unwrap(), member);
+
+        // Not a member: the pid is written.
+        fs::write(&procs, "1\n").unwrap();
+        cg.attach_pid().unwrap();
+        assert_eq!(fs::read_to_string(&procs).unwrap(), member);
     }
 
     #[test]

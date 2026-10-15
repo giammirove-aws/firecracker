@@ -141,7 +141,11 @@ After starting, the Jailer goes through the following operations:
   exec is created directly in the cgroup with `clone3(CLONE_INTO_CGROUP)`.
   Moving a process between cgroups waits for an RCU grace period, which can
   take tens of milliseconds. On kernels without `CLONE_INTO_CGROUP`, the jailer
-  moves itself into the cgroup right before cloning.
+  moves itself into the cgroup right before cloning. In the default mode, the
+  jailer skips moving itself if it is already in its cgroup, for example because
+  the caller created the cgroup (or used an existing `--parent-cgroup`) and
+  started the jailer inside it with `clone3(CLONE_INTO_CGROUP)`. Starting the
+  jailer this way avoids the wait in the default mode too.
 - Call `unshare()` into a new mount namespace, use `pivot_root()` to switch the
   old system root mount point with a new one base in `<chroot_dir>`, switch the
   current working directory to the new root, unmount the old root mount point,
