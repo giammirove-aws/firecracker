@@ -425,6 +425,38 @@ def test_cgroups(uvm, cgroups_info):
         check_cgroups_v2(test_microvm)
 
 
+def trace_cgroup_attach(vm):
+    """Trace how the jailer attaches to its cgroup. Returns the strace output path."""
+    strace_output_path = Path(vm.path, "strace-attach.out")
+    vm.add_pre_cmd(
+        ["strace", "-y", "-e", "trace=write,clone3", "-o", str(strace_output_path)]
+    )
+    return strace_output_path
+
+
+def check_cgroup_attach(vm, strace_output_path):
+    """
+    Assert how the jailer attached to its cgroup.
+
+    With --daemonize or --new-pid-ns, the process that execs Firecracker is
+    created in the cgroup by one clone3(CLONE_INTO_CGROUP), and nothing writes
+    to cgroup.procs. Otherwise, the jailer moves itself with one write.
+    """
+    strace_out = strace_output_path.read_text(encoding="utf-8").splitlines()
+    procs_writes = [line for line in strace_out if "/cgroup.procs>" in line]
+    clones = [line for line in strace_out if "CLONE_INTO_CGROUP" in line]
+    if vm.jailer.daemonize or vm.jailer.new_pid_ns:
+        assert (len(procs_writes), len(clones)) == (0, 1), strace_out
+    else:
+        assert (len(procs_writes), len(clones)) == (1, 0), strace_out
+
+
+def check_firecracker_cgroup(vm, cgroups_info, cgroup):
+    """Assert that Firecracker runs in `cgroup`, relative to the cgroup root."""
+    fc_cgroup = Path(f"/proc/{vm.firecracker_pid}/cgroup").read_text(encoding="ascii")
+    assert fc_cgroup.strip() == f"0::/{cgroup.relative_to(cgroups_info.root)}"
+
+
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 @pytest.mark.parametrize("daemonize", [True, False])
 @pytest.mark.parametrize("new_pid_ns", [True, False])
@@ -442,12 +474,41 @@ def test_cgroups_v2_jailer_modes(uvm, cgroups_info, daemonize, new_pid_ns):
     test_microvm.jailer.daemonize = daemonize
     test_microvm.jailer.new_pid_ns = new_pid_ns
     test_microvm.jailer.cgroups = ["cpu.weight.nice=10", "memory.max=1073741824"]
+    strace_output_path = trace_cgroup_attach(test_microvm)
     test_microvm.spawn()
 
     check_cgroups_v2(test_microvm)
     cg_jail = cgroups_info.root / FC_BINARY_NAME / test_microvm.jailer.jailer_id
-    fc_cgroup = Path(f"/proc/{test_microvm.firecracker_pid}/cgroup").read_text()
-    assert fc_cgroup.strip() == f"0::/{cg_jail.relative_to(cgroups_info.root)}"
+    check_firecracker_cgroup(test_microvm, cgroups_info, cg_jail)
+    check_cgroup_attach(test_microvm, strace_output_path)
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("daemonize", [True, False])
+@pytest.mark.parametrize("new_pid_ns", [True, False])
+def test_parent_cgroup_jailer_modes(uvm, cgroups_info, daemonize, new_pid_ns):
+    """
+    Test joining a pre-created `--parent-cgroup` (no `--cgroup`) in every jailer
+    process mode.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = daemonize
+    test_microvm.jailer.new_pid_ns = new_pid_ns
+    # Make it somewhat unique so it doesn't conflict with other test runs
+    parent_cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
+    test_microvm.jailer.parent_cgroup = parent_cgroup
+    cgroups_info.new_cgroup(parent_cgroup)
+    assert len(test_microvm.jailer.cgroups) == 0
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    test_microvm.spawn()
+
+    check_firecracker_cgroup(
+        test_microvm, cgroups_info, cgroups_info.root / parent_cgroup
+    )
+    check_cgroup_attach(test_microvm, strace_output_path)
 
 
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
