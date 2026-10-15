@@ -9,7 +9,6 @@ use std::num::NonZeroU16;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::device::{BlockResources, BlockRuntimeState, DiskProperties};
-use super::worker::WorkerHandle;
 use super::*;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::{
@@ -80,17 +79,16 @@ impl Persist<'_> for VirtioBlock {
 
     fn save(&self) -> Self::State {
         let virtio_state = if let BlockRuntimeState::Threaded(active) = &self.state {
-            VirtioDeviceState {
-                device_type: VirtioDeviceType::Block,
-                avail_features: self.avail_features,
-                acked_features: self.acked_features,
-                queues: active
-                    .worker_handles
-                    .iter()
-                    .map(WorkerHandle::get_queue_state)
-                    .collect(),
-                activated: true,
-            }
+            // `prepare_save` has taken the workers back, so their queues cannot move under the
+            // snapshot.
+            assert!(
+                !active.paused.is_empty(),
+                "a threaded block device is saved only after prepare_save"
+            );
+            VirtioDeviceState::from_device(
+                self,
+                active.paused.iter().map(|worker| &worker.resources.queue),
+            )
         } else {
             VirtioDeviceState::from_device(self, self.resources().iter().map(|r| &r.queue))
         };
@@ -182,6 +180,7 @@ impl Persist<'_> for VirtioBlock {
             config,
             rate_limiter: SharedRateLimiter::new(rate_limiter),
             state: BlockRuntimeState::Configuring(resources, Vec::new()),
+            worker_queue_evts: Vec::new(),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
         })
     }
@@ -304,7 +303,7 @@ mod tests {
             let mut block =
                 default_block_with_path(disk.as_path().to_str().unwrap().to_string(), engine);
             block.config.num_queues = NonZeroU16::new(1);
-            block.spawn_worker(Arc::new(vec![])).unwrap();
+            block.spawn_workers(&Arc::new(vec![])).unwrap();
             let mem = default_mem();
             let vq = VirtQueue::new(GuestAddress(0), &mem, BLOCK_QUEUE_SIZE);
             set_queue(&mut block, 0, vq.create_queue());
@@ -338,7 +337,7 @@ mod tests {
             let mut config = default_config(disk_path, engine);
             config.num_queues = NonZeroU16::new(2);
             let mut block = VirtioBlock::new(config).unwrap();
-            block.spawn_worker(Arc::new(vec![])).unwrap();
+            block.spawn_workers(&Arc::new(vec![])).unwrap();
             let mem = default_mem();
             let vq = VirtQueue::new(GuestAddress(0), &mem, BLOCK_QUEUE_SIZE);
             set_queue(&mut block, 0, vq.create_queue());
