@@ -4,34 +4,22 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
 use super::io::FileEngine;
-use crate::devices::virtio::block::virtio::device::VirtioBlock;
+use crate::devices::virtio::block::virtio::device::{BlockRuntimeState, VirtioBlock};
 use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::worker::{
+    INLINE_WORKER_TOKEN_BASE, QueueGroupWorker, register_inline_events,
+};
 use crate::logger::{error, warn};
 
 impl VirtioBlock {
+    // The data path's own events (queue, IO engine completion) are the inline worker's,
+    // registered from its event list at INLINE_WORKER_TOKEN_BASE and up.
     const PROCESS_ACTIVATE: u32 = 0;
-    const PROCESS_QUEUE: u32 = 1;
-    const PROCESS_RATE_LIMITER: u32 = 2;
-    const PROCESS_ASYNC_COMPLETION: u32 = 3;
+    const PROCESS_RATE_LIMITER: u32 = 1;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
-        let resources = self.resources();
-        assert_eq!(resources.len(), 1, "inline block must have one queue");
-        if let Err(err) = ops.add(Events::with_data(
-            &resources[0].queue_evt,
-            Self::PROCESS_QUEUE,
-            EventSet::IN,
-        )) {
-            error!("Failed to register queue event: {}", err);
-        }
-        if let FileEngine::Async(engine) = &resources[0].disk.file_engine
-            && let Err(err) = ops.add(Events::with_data(
-                engine.completion_evt(),
-                Self::PROCESS_ASYNC_COMPLETION,
-                EventSet::IN,
-            ))
-        {
-            error!("Failed to register IO engine completion event: {}", err);
+        if let BlockRuntimeState::Inline(worker) = &self.state {
+            register_inline_events(ops, worker.events());
         }
     }
 
@@ -61,9 +49,7 @@ impl VirtioBlock {
         }
 
         self.register_rate_limiter_event(ops);
-        if !self.is_threaded_active() {
-            self.register_runtime_events(ops);
-        }
+        self.register_runtime_events(ops);
 
         if let Err(err) = ops.remove(Events::with_data(
             &self.activate_evt,
@@ -95,9 +81,12 @@ impl MutEventSubscriber for VirtioBlock {
         if self.is_activated() {
             match source {
                 Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
-                Self::PROCESS_QUEUE => self.process_queue_event(),
                 Self::PROCESS_RATE_LIMITER => self.process_rate_limiter_event(),
-                Self::PROCESS_ASYNC_COMPLETION => self.process_async_completion_event(),
+                token if token >= INLINE_WORKER_TOKEN_BASE => {
+                    if let BlockRuntimeState::Inline(worker) = &mut self.state {
+                        worker.process(token - INLINE_WORKER_TOKEN_BASE);
+                    }
+                }
                 _ => warn!("Block: Spurious event received: {:?}", source),
             }
         } else {
@@ -109,15 +98,17 @@ impl MutEventSubscriber for VirtioBlock {
                 Self::PROCESS_ACTIVATE => {
                     let _ = self.activate_evt.read();
                 }
-                Self::PROCESS_QUEUE => self.drain_queue_events(),
                 Self::PROCESS_RATE_LIMITER => {
                     let _ = self.rate_limiter.lock().event_handler();
                 }
-                Self::PROCESS_ASYNC_COMPLETION => {
-                    let resources = self.resources();
-                    assert_eq!(resources.len(), 1, "inline block must have one queue");
-                    if let FileEngine::Async(engine) = &resources[0].disk.file_engine {
-                        let _ = engine.completion_evt().read();
+                // The inline worker's events stay registered across a reset: consume whichever
+                // fired (reading an eventfd that did not is a harmless EAGAIN).
+                token if token >= INLINE_WORKER_TOKEN_BASE => {
+                    self.drain_queue_events();
+                    for resources in self.resources() {
+                        if let FileEngine::Async(engine) = &resources.disk.file_engine {
+                            let _ = engine.completion_evt().read();
+                        }
                     }
                 }
                 _ => (),
@@ -132,9 +123,7 @@ impl MutEventSubscriber for VirtioBlock {
         //  - on device restore from snapshot.
         if self.is_activated() {
             self.register_rate_limiter_event(ops);
-            if !self.is_threaded_active() {
-                self.register_runtime_events(ops);
-            }
+            self.register_runtime_events(ops);
         } else {
             self.register_activate_event(ops);
         }

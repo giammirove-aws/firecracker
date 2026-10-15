@@ -52,6 +52,28 @@ pub enum WorkerError {
     Notify(#[from] std::io::Error),
 }
 
+/// Tokens at or above this belong to a device's inline worker, registered on the VMM event loop
+/// next to the device's own events (see [`register_inline_events`]); the device forwards them to
+/// the worker's [`QueueGroupWorker::process`] with this subtracted.
+pub(crate) const INLINE_WORKER_TOKEN_BASE: u32 = 1 << 16;
+
+/// Registers an inline worker's epoll sources on the VMM event loop, so that inline and threaded
+/// mode watch the same list.
+pub(crate) fn register_inline_events(ops: &mut EventOps, events: Vec<WorkerEvent>) {
+    for event in events {
+        if let Err(err) = ops.add(Events::with_data_raw(
+            event.fd,
+            INLINE_WORKER_TOKEN_BASE + event.token,
+            event.events,
+        )) {
+            error!(
+                "Failed to register inline worker event {}: {err}",
+                event.token
+            );
+        }
+    }
+}
+
 /// One epoll source of a worker: the fd to watch, how, and the token [`QueueGroupWorker::process`]
 /// receives for it.
 #[derive(Debug)]
