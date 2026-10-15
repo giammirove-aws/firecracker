@@ -33,6 +33,8 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::EventManager;
+use crate::devices::virtio::queue::QueueConfig;
+use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::logger::{error, warn};
 use crate::seccomp::{BpfProgram, apply_filter};
 
@@ -120,6 +122,323 @@ pub(crate) trait QueueGroupWorker: Send + Sized + Debug {
     /// Distinct from [`Self::into_resources`] because teardown may need to flush a backend where a
     /// reset only needs to drain it.
     fn shutdown(self);
+}
+
+/// Which half of a device owns its data-path resources.
+///
+/// Every device whose data path is a set of [`QueueGroupWorker`] queue groups has the same three
+/// states, so they live here rather than once per device. The states describe *ownership*, not the
+/// virtio device status: the transport configures the queues in place while they are still the
+/// device's, they move into the workers on activation, and they come back on reset.
+///
+/// The configuring and threaded states always hold a `Vec`, even for a device with exactly one
+/// queue group today. That is the extension axis — a device gains queue groups by pushing to these
+/// vectors — and keeping it uniform is what lets the state machine itself be shared. An inline data
+/// path is one queue group on the VMM thread, so it holds one worker.
+///
+/// `pub(crate)` only so that `persist.rs` can build the `Configuring` state on snapshot restore.
+#[derive(Debug)]
+pub(crate) enum DeviceState<W: QueueGroupWorker> {
+    /// The transport configures the queues in place, before activation. In threaded mode the worker
+    /// threads have already been spawned and are parked, waiting for the resources.
+    Configuring(Vec<W::Resources>, Vec<WorkerHandle<W>>),
+    /// Activated: the resources have moved into the workers.
+    Active(ActiveDevice<W>),
+    /// Transient placeholder, held only while the state machine moves resources around.
+    Placeholder,
+}
+
+/// What the configuration half of a device can reach once it is activated.
+#[derive(Debug)]
+pub(crate) enum ActiveDevice<W: QueueGroupWorker> {
+    /// Driven from the VMM event loop: the device still owns its one worker and calls it directly,
+    /// queue configuration included. Boxed, because a worker is far larger than the threaded
+    /// variant.
+    Inline { worker: Box<W> },
+    /// Driven from one thread per queue group, reached only through their handles.
+    Threaded {
+        handles: Vec<WorkerHandle<W>>,
+        /// The interrupt the transport signals configuration changes on.
+        ///
+        /// Kept here, rather than only in the workers, because the workers are on other threads:
+        /// the VMM thread has no way to reach the clone that travelled with them. In inline mode
+        /// there is no such split, so the worker's own copy is the only one.
+        interrupt: Arc<dyn VirtioInterrupt>,
+        /// A clone of the queue configuration, taken before the queues moved into the workers.
+        ///
+        /// The transport keeps reading it for MMIO and PCI register accesses. This is sound
+        /// because `QueueConfig` is written only before `DRIVER_OK`: the driver programs the ring
+        /// addresses and `ready`, then activation happens, and after that the transport only reads.
+        queue_cfg: Vec<QueueConfig>,
+        /// The workers, while they are taken back from their threads for a snapshot (see
+        /// [`ActiveDevice::prepare_save`]); the next [`ActiveDevice::kick`] starts them again.
+        /// Empty while the threads run them.
+        paused: Vec<W>,
+    },
+}
+
+impl<W: QueueGroupWorker + 'static> ActiveDevice<W> {
+    /// Hands the freshly built workers over, either to their threads or to the device itself.
+    ///
+    /// `handles` is empty exactly when the data path is inline, which serves one queue group; the
+    /// caller has already checked that against its own `threaded` configuration. `queue_cfg`
+    /// clones the workers' queue configuration, in transport order, for a threaded data path.
+    pub(crate) fn start(
+        mut workers: Vec<W>,
+        handles: Vec<WorkerHandle<W>>,
+        interrupt: Arc<dyn VirtioInterrupt>,
+        queue_cfg: impl FnOnce(&[W]) -> Vec<QueueConfig>,
+    ) -> Result<Self, WorkerError> {
+        if handles.is_empty() {
+            assert_eq!(workers.len(), 1, "an inline data path has one queue group");
+            let worker = Box::new(workers.pop().unwrap());
+            return Ok(Self::Inline { worker });
+        }
+
+        assert_eq!(
+            handles.len(),
+            workers.len(),
+            "one worker thread must be spawned for each queue group"
+        );
+        let queue_cfg = queue_cfg(&workers);
+        for (handle, worker) in handles.iter().zip(workers) {
+            handle.start(worker)?;
+        }
+        Ok(Self::Threaded {
+            handles,
+            interrupt,
+            queue_cfg,
+            paused: Vec::new(),
+        })
+    }
+
+    /// The one worker the device drives itself, inline. `None` in threaded mode, where the workers
+    /// are on other threads and can only be reached through their handles.
+    pub(crate) fn inline_worker_mut(&mut self) -> Option<&mut W> {
+        match self {
+            Self::Inline { worker, .. } => Some(worker.as_mut()),
+            Self::Threaded { .. } => None,
+        }
+    }
+
+    /// See [`Self::inline_worker_mut`].
+    pub(crate) fn inline_worker(&self) -> Option<&W> {
+        match self {
+            Self::Inline { worker, .. } => Some(worker.as_ref()),
+            Self::Threaded { .. } => None,
+        }
+    }
+
+    /// Quiesces the data path so that a consistent snapshot can be taken.
+    ///
+    /// A snapshot is a reset followed by a restart, as crosvm's `virtio_sleep` and `virtio_wake`
+    /// do, except that nothing is cleared: every worker thread quiesces its worker and hands it
+    /// back whole, and parks. The device then saves from the workers it holds, and the next
+    /// [`Self::kick`], when the VM resumes, starts them again. An inline worker quiesces in place
+    /// because the VMM thread is already the only one that could touch it. A second snapshot of
+    /// the same pause finds the workers taken already.
+    ///
+    /// Workers quiesce one at a time, in queue-group order, each finishing before the next starts.
+    /// Devices rely on it: block flushes its backing file from its last queue only.
+    pub(crate) fn prepare_save(&mut self) {
+        match self {
+            Self::Inline { worker, .. } => worker.prepare_save(),
+            Self::Threaded {
+                handles, paused, ..
+            } if paused.is_empty() => {
+                *paused = handles
+                    .iter()
+                    .map(|handle| {
+                        handle
+                            .hand_back()
+                            .expect("an active queue group worker must answer a hand-back")
+                            .expect("an active queue group worker must hand its worker back")
+                    })
+                    .collect();
+            }
+            Self::Threaded { .. } => {}
+        }
+    }
+
+    /// Starts the workers taken back for a snapshot on their threads again, then asks every
+    /// worker thread to look for pending queue work.
+    ///
+    /// Returns `false` if the data path is inline, in which case the caller has to poke the queue
+    /// eventfds instead.
+    pub(crate) fn kick(&mut self) -> bool {
+        let Self::Threaded {
+            handles, paused, ..
+        } = self
+        else {
+            return false;
+        };
+        for (handle, worker) in handles.iter().zip(paused.drain(..)) {
+            if let Err(err) = handle.start(worker) {
+                error!("Failed to restart a queue group worker: {err}");
+            }
+        }
+        for handle in handles.iter() {
+            if let Err(err) = handle.kick() {
+                error!("Failed to kick a queue group worker: {err}");
+            }
+        }
+        true
+    }
+
+    /// Marks dirty the queue pages the workers wrote since the last call: an inline worker and the
+    /// workers taken back for a snapshot directly, the running ones on their threads.
+    pub(crate) fn commit_dirty(&self) {
+        match self {
+            Self::Inline { worker } => worker.commit_dirty(),
+            Self::Threaded {
+                handles, paused, ..
+            } => {
+                for handle in handles {
+                    if let Err(err) = handle.commit_dirty() {
+                        error!("Failed to commit the dirty pages of a queue group worker: {err}");
+                    }
+                }
+                for worker in paused {
+                    worker.commit_dirty();
+                }
+            }
+        }
+    }
+
+    /// Takes the data-path resources back, and with them the worker threads, so that the device can
+    /// be activated again without rebuilding either.
+    pub(crate) fn into_resources(self) -> (Vec<W::Resources>, Vec<WorkerHandle<W>>) {
+        match self {
+            Self::Inline { worker, .. } => (vec![worker.into_resources()], Vec::new()),
+            // Workers taken back for a snapshot are the device's already, and their threads are
+            // parked: they hand their resources back here.
+            Self::Threaded {
+                handles, paused, ..
+            } if !paused.is_empty() => {
+                (paused.into_iter().map(W::into_resources).collect(), handles)
+            }
+            Self::Threaded { handles, .. } => {
+                let resources = handles
+                    .iter()
+                    .map(|handle| {
+                        handle
+                            .reset()
+                            .expect("an active queue group worker must answer a reset")
+                            .expect("an active queue group worker must return its resources")
+                    })
+                    .collect();
+                (resources, handles)
+            }
+        }
+    }
+}
+
+impl<W: QueueGroupWorker + 'static> DeviceState<W> {
+    /// Whether the device is activated.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+
+    /// The activated data path, if there is one.
+    pub(crate) fn active(&self) -> Option<&ActiveDevice<W>> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Configuring(..) | Self::Placeholder => None,
+        }
+    }
+
+    /// See [`Self::active`].
+    pub(crate) fn active_mut(&mut self) -> Option<&mut ActiveDevice<W>> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Configuring(..) | Self::Placeholder => None,
+        }
+    }
+
+    /// Asks the activated data path to look for pending queue work, without restarting it: the
+    /// inline worker processes its queues in place, and every worker thread is kicked.
+    ///
+    /// Unlike [`ActiveDevice::kick`], this never starts the workers taken back for a snapshot:
+    /// they stay with the device, and their parked threads ignore the kick.
+    pub(crate) fn kick_running(&mut self) {
+        match self {
+            Self::Active(ActiveDevice::Inline { worker, .. }) => worker.kick(),
+            Self::Active(ActiveDevice::Threaded { handles, .. }) => {
+                for handle in handles.iter() {
+                    if let Err(err) = handle.kick() {
+                        error!("Failed to kick a queue group worker: {err}");
+                    }
+                }
+            }
+            Self::Configuring(..) | Self::Placeholder => {}
+        }
+    }
+
+    /// The worker the device drives itself, which only exists once it is activated inline.
+    pub(crate) fn inline_worker_mut(&mut self) -> Option<&mut W> {
+        self.active_mut().and_then(ActiveDevice::inline_worker_mut)
+    }
+
+    /// See [`Self::inline_worker_mut`].
+    pub(crate) fn inline_worker(&self) -> Option<&W> {
+        self.active().and_then(ActiveDevice::inline_worker)
+    }
+
+    /// Spawns one parked worker thread per queue group, unless they are already running.
+    ///
+    /// `thread_name` names the thread of the queue group with the given index. If any thread fails
+    /// to spawn, the ones before it are torn down again: a device with only some of its groups
+    /// threaded has nothing to drive the rest with.
+    pub(crate) fn spawn_workers(
+        &mut self,
+        seccomp_filter: &Arc<BpfProgram>,
+        thread_name: impl Fn(usize) -> String,
+    ) -> Result<(), WorkerError> {
+        let Self::Configuring(resources, handles) = self else {
+            return Ok(());
+        };
+        if !handles.is_empty() {
+            assert_eq!(handles.len(), resources.len());
+            return Ok(());
+        }
+
+        let mut spawned = Vec::with_capacity(resources.len());
+        for group_index in 0..resources.len() {
+            match WorkerHandle::spawn(seccomp_filter.clone(), thread_name(group_index)) {
+                Ok(handle) => spawned.push(handle),
+                Err(err) => {
+                    spawned.into_iter().for_each(WorkerHandle::finish);
+                    return Err(err);
+                }
+            }
+        }
+        *handles = spawned;
+        Ok(())
+    }
+
+    /// Tears the data path down for good, on the way to dropping the device.
+    ///
+    /// Every worker gets its final quiesce — which for some backends is a flush, not just a drain —
+    /// and every thread is joined. A device dropped before it was ever activated still has parked
+    /// threads to join. As in [`ActiveDevice::prepare_save`], workers quiesce one at a time, in
+    /// queue-group order.
+    pub(crate) fn shutdown(&mut self) {
+        match std::mem::replace(self, Self::Placeholder) {
+            Self::Active(ActiveDevice::Inline { worker, .. }) => worker.shutdown(),
+            // Workers taken back for a snapshot get their final quiesce here, on the VMM thread
+            // that holds them, before their parked threads are joined.
+            Self::Active(ActiveDevice::Threaded {
+                handles, paused, ..
+            }) => {
+                paused.into_iter().for_each(W::shutdown);
+                handles.into_iter().for_each(WorkerHandle::finish);
+            }
+            Self::Configuring(_, handles) => {
+                handles.into_iter().for_each(WorkerHandle::finish);
+            }
+            Self::Placeholder => {}
+        }
+    }
 }
 
 /// The lifecycle state of a queue-group worker thread.

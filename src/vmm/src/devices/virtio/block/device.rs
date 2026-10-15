@@ -12,7 +12,7 @@ use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
-use crate::devices::virtio::queue::{InvalidAvailIdx, QueueConfig};
+use crate::devices::virtio::queue::QueueConfig;
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
@@ -78,13 +78,6 @@ impl Block {
         match self {
             Self::Virtio(_) => Err(BlockError::InvalidBlockBackend),
             Self::VhostUser(b) => b.config_update().map_err(BlockError::VhostUserBackend),
-        }
-    }
-
-    pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
-        match self {
-            Self::Virtio(b) => b.process_virtio_queues(),
-            Self::VhostUser(_) => Ok(()),
         }
     }
 

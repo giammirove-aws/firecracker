@@ -37,9 +37,9 @@ use crate::devices::virtio::generated::virtio_blk::{
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueConfig};
+use crate::devices::virtio::queue::{Queue, QueueConfig};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
-use crate::devices::virtio::worker::{QueueGroupWorker, WorkerError, WorkerHandle};
+use crate::devices::virtio::worker::{ActiveDevice, DeviceState, WorkerError};
 use crate::impl_device_type;
 use crate::logger::{IncMetric, error, warn};
 use crate::rate_limiter::{BucketUpdate, RateLimiter, SharedRateLimiter};
@@ -393,39 +393,12 @@ pub struct VirtioBlock {
 
     pub(crate) config: VirtioBlockConfig,
     pub(crate) rate_limiter: SharedRateLimiter,
-    pub(crate) state: BlockRuntimeState,
+    pub(crate) state: DeviceState<BlockWorker>,
     /// Clones of the queue eventfds, in queue order, taken when the worker threads are spawned:
     /// the transport keeps writing to them after the originals have moved into the workers.
     /// Empty while the data path is inline.
     pub(crate) worker_queue_evts: Vec<EventFd>,
     pub metrics: Arc<BlockDeviceMetrics>,
-}
-
-/// State of the block data-path resources.
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum BlockRuntimeState {
-    // Vmm owns the runtime resources before activation
-    // In threaded mode, it also owns parked worker threads
-    Configuring(Vec<BlockResources>, Vec<WorkerHandle<BlockWorker>>),
-    // Data path on VMM thread (single thread)
-    Inline(BlockWorker),
-    // Data path on a dedicated worker thread (multi thread)
-    Threaded(ThreadedActive),
-    // Placeholder to hold state when activating
-    Placeholder,
-}
-
-/// VMM-side state when data paths run on worker threads
-#[derive(Debug)]
-pub(crate) struct ThreadedActive {
-    pub(crate) worker_handles: Vec<WorkerHandle<BlockWorker>>,
-    interrupt: Arc<dyn VirtioInterrupt>,
-    queue_configs: Vec<QueueConfig>,
-    /// The workers, while they are taken back from their threads for a snapshot (see
-    /// `VirtioBlock::prepare_save`); the next kick starts them again. Empty while the threads run
-    /// them.
-    pub(crate) paused: Vec<BlockWorker>,
 }
 
 /// Runtime resources used by the block data path.
@@ -469,7 +442,8 @@ impl BlockResources {
     ///
     /// Every queue writes through its own descriptor of the same file, and one fsync covers what
     /// all of them wrote, so only the last queue flushes. That fsync comes after every other queue
-    /// drained, because the data path quiesces queues one at a time in index order.
+    /// drained, because the data path quiesces queues one at a time in index order (see
+    /// `ActiveDevice::prepare_save` and `DeviceState::shutdown`).
     fn quiesce(&mut self, flush: bool, discard: bool) -> Result<(), BlockIoError> {
         if flush {
             self.disk.file_engine.drain_and_flush(discard)
@@ -598,7 +572,7 @@ impl VirtioBlock {
 
             config,
             rate_limiter: SharedRateLimiter::new(rate_limiter),
-            state: BlockRuntimeState::Configuring(resources, Vec::new()),
+            state: DeviceState::Configuring(resources, Vec::new()),
             worker_queue_evts: Vec::new(),
             metrics,
         })
@@ -609,25 +583,44 @@ impl VirtioBlock {
         self.config.clone()
     }
 
-    pub(crate) fn resources(&self) -> &[BlockResources] {
+    /// The data-path resources, one per queue, while the device can reach them: before
+    /// activation, inline, and while the workers are taken back from their threads for a
+    /// snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics while worker threads run them, where only the handles can reach them.
+    pub(crate) fn resources(&self) -> Vec<&BlockResources> {
         match &self.state {
-            BlockRuntimeState::Configuring(resources, _) => resources,
-            BlockRuntimeState::Inline(worker) => std::slice::from_ref(&worker.resources),
-            BlockRuntimeState::Threaded(_) => {
+            DeviceState::Configuring(resources, _) => resources.iter().collect(),
+            DeviceState::Active(ActiveDevice::Inline { worker, .. }) => vec![&worker.resources],
+            DeviceState::Active(ActiveDevice::Threaded { paused, .. }) if !paused.is_empty() => {
+                paused.iter().map(|worker| &worker.resources).collect()
+            }
+            DeviceState::Active(ActiveDevice::Threaded { .. }) => {
                 unreachable!("worker thread owns the runtime resources")
             }
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
-    pub(crate) fn resources_mut(&mut self) -> &mut [BlockResources] {
+    /// See [`Self::resources`].
+    pub(crate) fn resources_mut(&mut self) -> Vec<&mut BlockResources> {
         match &mut self.state {
-            BlockRuntimeState::Configuring(resources, _) => resources,
-            BlockRuntimeState::Inline(worker) => std::slice::from_mut(&mut worker.resources),
-            BlockRuntimeState::Threaded(_) => {
+            DeviceState::Configuring(resources, _) => resources.iter_mut().collect(),
+            DeviceState::Active(ActiveDevice::Inline { worker, .. }) => {
+                vec![&mut worker.resources]
+            }
+            DeviceState::Active(ActiveDevice::Threaded { paused, .. }) if !paused.is_empty() => {
+                paused
+                    .iter_mut()
+                    .map(|worker| &mut worker.resources)
+                    .collect()
+            }
+            DeviceState::Active(ActiveDevice::Threaded { .. }) => {
                 unreachable!("worker thread owns the runtime resources")
             }
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
@@ -638,7 +631,10 @@ impl VirtioBlock {
 
     #[cfg(test)]
     pub(crate) fn is_threaded_active(&self) -> bool {
-        matches!(self.state, BlockRuntimeState::Threaded(_))
+        matches!(
+            self.state,
+            DeviceState::Active(ActiveDevice::Threaded { .. })
+        )
     }
 
     /// Process a single event in the Virtio queue.
@@ -647,17 +643,8 @@ impl VirtioBlock {
     /// about new buffers in the queue. Production events reach the inline worker directly.
     #[cfg(test)]
     pub(crate) fn process_queue_event(&mut self) {
-        if let BlockRuntimeState::Inline(worker) = &mut self.state {
+        if let Some(worker) = self.state.inline_worker_mut() {
             worker.process_queue_event();
-        }
-    }
-
-    /// Process device virtio queue(s).
-    pub fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
-        if let BlockRuntimeState::Inline(worker) = &mut self.state {
-            worker.process_queue()
-        } else {
-            Ok(())
         }
     }
 
@@ -670,28 +657,19 @@ impl VirtioBlock {
         // Upon rate limiter event, call the rate limiter handler
         // and restart processing the queue.
         //
-        // A kick only reaches a worker its thread runs. A worker taken back for a snapshot stays
-        // with the device even if the limiter unblocks in the meantime.
-        match &mut self.state {
-            BlockRuntimeState::Inline(worker) => {
-                worker.process_queue().unwrap();
-            }
-            BlockRuntimeState::Threaded(active) => {
-                for handle in &active.worker_handles {
-                    if let Err(err) = handle.kick() {
-                        error!("Failed to kick a block worker after a rate limiter event: {err}");
-                    }
-                }
-            }
-            BlockRuntimeState::Configuring(_, _) => {}
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+        // An inline drive stops the VMM on an invalid avail index here, as on its queue event. A
+        // worker taken back for a snapshot stays with the device even if the limiter unblocks in
+        // the meantime.
+        match self.state.inline_worker_mut() {
+            Some(worker) => worker.process_queue().unwrap(),
+            None => self.state.kick_running(),
         }
     }
 
     /// See [`Self::process_queue_event`].
     #[cfg(test)]
     pub fn process_async_completion_event(&mut self) {
-        if let BlockRuntimeState::Inline(worker) = &mut self.state {
+        if let Some(worker) = self.state.inline_worker_mut() {
             worker.process_async_completion_event();
         }
     }
@@ -700,8 +678,8 @@ impl VirtioBlock {
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
         // Worker threads run the disk. Take the workers back as for a snapshot, switch them below,
         // and start them again: on the old disk if the switch failed.
-        if let BlockRuntimeState::Threaded(active) = &self.state
-            && active.paused.is_empty()
+        if let DeviceState::Active(ActiveDevice::Threaded { paused, .. }) = &self.state
+            && paused.is_empty()
         {
             self.prepare_save();
             let result = self.update_disk_image(disk_image_path);
@@ -709,45 +687,37 @@ impl VirtioBlock {
             return result;
         }
 
-        let config_path = disk_image_path.clone();
         let read_only = self.config.is_read_only;
         let file_engine_type = self.config.file_engine_type;
-        let nsectors = match &mut self.state {
-            BlockRuntimeState::Configuring(resources, _) => {
-                let (last, rest) = resources
-                    .split_last_mut()
-                    .expect("block device must have at least one queue");
-                for resource in rest {
+        let mut nsectors = None;
+        match &mut self.state {
+            DeviceState::Configuring(resources, _) => {
+                for resource in resources {
                     resource.disk.update(disk_image_path.clone(), read_only)?;
+                    nsectors = Some(resource.disk.nsectors);
                 }
-                last.disk.update(disk_image_path, read_only)?;
-                last.disk.nsectors
             }
-            BlockRuntimeState::Inline(worker) => {
-                worker.update_disk_image(disk_image_path, read_only)?
+            DeviceState::Active(ActiveDevice::Inline { worker, .. }) => {
+                nsectors = Some(worker.update_disk_image(disk_image_path.clone(), read_only)?);
             }
             // The workers the device holds, taken back for a snapshot or above. Every queue opens
             // its own descriptor of the new file before any is switched, so that a failure leaves
             // them all on the old one.
-            BlockRuntimeState::Threaded(active) => {
-                let disks = active
-                    .paused
+            DeviceState::Active(ActiveDevice::Threaded { paused, .. }) => {
+                let disks = paused
                     .iter()
                     .map(|_| DiskProperties::new(&disk_image_path, read_only, file_engine_type))
                     .collect::<Result<Vec<_>, _>>()?;
-                let nsectors = disks
-                    .last()
-                    .expect("threaded block device must have at least one worker")
-                    .nsectors;
-                for (worker, disk) in active.paused.iter_mut().zip(disks) {
+                for (worker, disk) in paused.iter_mut().zip(disks) {
+                    nsectors = Some(disk.nsectors);
                     worker.resources.disk = disk;
                 }
-                nsectors
             }
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
-        };
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
+        }
+        let nsectors = nsectors.expect("block device must have at least one queue");
         self.config_space.capacity = nsectors.to_le();
-        self.config.path_on_host = config_path;
+        self.config.path_on_host = disk_image_path;
 
         // Kick the driver to pick up the changes. (But only if the device is already activated).
         if self.is_activated() {
@@ -774,26 +744,8 @@ impl VirtioBlock {
 
     /// Prepare device for being snapshotted.
     pub fn prepare_save(&mut self) {
-        match &mut self.state {
-            BlockRuntimeState::Inline(worker) => worker.prepare_save(),
-            // Take the workers back, so their queues cannot move under the snapshot: one at a
-            // time, in queue order, so the last queue flushes after every other drained. A second
-            // snapshot of the same pause finds them taken already.
-            BlockRuntimeState::Threaded(active) if active.paused.is_empty() => {
-                active.paused = active
-                    .worker_handles
-                    .iter()
-                    .map(|handle| {
-                        handle
-                            .hand_back()
-                            .expect("an active block worker must answer a hand-back")
-                            .expect("an active block worker must hand its worker back")
-                    })
-                    .collect();
-            }
-            BlockRuntimeState::Threaded(_) => {}
-            BlockRuntimeState::Configuring(_, _) => {}
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+        if let Some(active) = self.state.active_mut() {
+            active.prepare_save();
         }
     }
 
@@ -802,37 +754,24 @@ impl VirtioBlock {
         &mut self,
         seccomp_filter: &Arc<BpfProgram>,
     ) -> Result<(), WorkerError> {
-        if let BlockRuntimeState::Configuring(resources, worker_handles) = &mut self.state {
-            if !worker_handles.is_empty() {
-                assert_eq!(worker_handles.len(), resources.len());
-                return Ok(());
-            }
-
-            // The transport keeps writing to the queue eventfds after the originals have moved
-            // into the workers, so it needs its own clones.
-            let queue_evts = resources
-                .iter()
-                .map(|resource| resource.queue_evt.try_clone())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(WorkerError::Spawn)?;
-
-            let mut spawned: Vec<WorkerHandle<BlockWorker>> = Vec::with_capacity(resources.len());
-            for resource in resources {
-                let name = format!("fc_q{}_{}", resource.queue_idx, self.config.drive_id);
-                let worker = match WorkerHandle::spawn(seccomp_filter.clone(), name) {
-                    Ok(worker) => worker,
-                    Err(err) => {
-                        for handle in spawned {
-                            handle.finish();
-                        }
-                        return Err(err);
-                    }
-                };
-                spawned.push(worker);
-            }
-            *worker_handles = spawned;
-            self.worker_queue_evts = queue_evts;
+        let DeviceState::Configuring(resources, handles) = &self.state else {
+            return Ok(());
+        };
+        if !handles.is_empty() {
+            return Ok(());
         }
+        // The transport keeps writing to the queue eventfds after the originals have moved into
+        // the workers, so it needs its own clones.
+        let queue_evts = resources
+            .iter()
+            .map(|resource| resource.queue_evt.try_clone())
+            .collect::<Result<_, _>>()
+            .map_err(WorkerError::Spawn)?;
+        let drive_id = &self.config.drive_id;
+        self.state.spawn_workers(seccomp_filter, |queue_idx| {
+            format!("fc_q{queue_idx}_{drive_id}")
+        })?;
+        self.worker_queue_evts = queue_evts;
         Ok(())
     }
 }
@@ -866,49 +805,49 @@ impl VirtioDevice for VirtioBlock {
 
     fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
         match &self.state {
-            BlockRuntimeState::Configuring(resources, _) => {
-                resources.get(index).map(|r| &r.queue.config)
-            }
-            BlockRuntimeState::Inline(worker) => {
+            DeviceState::Configuring(resources, _) => resources.get(index).map(|r| &r.queue.config),
+            DeviceState::Active(ActiveDevice::Inline { worker }) => {
                 (index == 0).then_some(&worker.resources.queue.config)
             }
-            BlockRuntimeState::Threaded(active) => active.queue_configs.get(index),
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Active(ActiveDevice::Threaded { queue_cfg, .. }) => queue_cfg.get(index),
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
     fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {
         match &mut self.state {
-            BlockRuntimeState::Configuring(resources, _) => {
+            DeviceState::Configuring(resources, _) => {
                 resources.get_mut(index).map(|r| &mut r.queue.config)
             }
-            BlockRuntimeState::Inline(worker) => {
+            DeviceState::Active(ActiveDevice::Inline { worker }) => {
                 (index == 0).then_some(&mut worker.resources.queue.config)
             }
-            BlockRuntimeState::Threaded(active) => active.queue_configs.get_mut(index),
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Active(ActiveDevice::Threaded { queue_cfg, .. }) => {
+                queue_cfg.get_mut(index)
+            }
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
     fn queue_event(&self, index: usize) -> Option<&EventFd> {
         match &self.state {
-            BlockRuntimeState::Configuring(resources, _) => {
-                resources.get(index).map(|r| &r.queue_evt)
-            }
-            BlockRuntimeState::Inline(worker) => {
+            DeviceState::Configuring(resources, _) => resources.get(index).map(|r| &r.queue_evt),
+            DeviceState::Active(ActiveDevice::Inline { worker, .. }) => {
                 (index == 0).then_some(&worker.resources.queue_evt)
             }
-            BlockRuntimeState::Threaded(_) => self.worker_queue_evts.get(index),
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Active(ActiveDevice::Threaded { .. }) => self.worker_queue_evts.get(index),
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
     fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {
         match &self.state {
-            BlockRuntimeState::Inline(worker) => worker.active_state.interrupt.deref(),
-            BlockRuntimeState::Threaded(active) => active.interrupt.deref(),
-            BlockRuntimeState::Configuring(_, _) => panic!("Device is not initialized"),
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Active(ActiveDevice::Inline { worker, .. }) => {
+                worker.active_state.interrupt.deref()
+            }
+            DeviceState::Active(ActiveDevice::Threaded { interrupt, .. }) => interrupt.deref(),
+            DeviceState::Configuring(_, _) => panic!("Device is not initialized"),
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
@@ -934,7 +873,7 @@ impl VirtioDevice for VirtioBlock {
 
         let event_idx = self.has_feature(u64::from(VIRTIO_RING_F_EVENT_IDX));
 
-        let BlockRuntimeState::Configuring(resources, _) = &mut self.state else {
+        let DeviceState::Configuring(resources, _) = &mut self.state else {
             unreachable!("inactive device is not configurable");
         };
 
@@ -956,55 +895,45 @@ impl VirtioDevice for VirtioBlock {
             return Err(ActivateError::EventFd);
         }
 
-        let BlockRuntimeState::Configuring(mut resources, worker_handles) =
-            std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder)
+        let DeviceState::Configuring(resources, worker_handles) =
+            std::mem::replace(&mut self.state, DeviceState::Placeholder)
         else {
             unreachable!("state checked before activation");
         };
-
         if worker_handles.is_empty() {
             assert_eq!(resources.len(), 1, "inline block must have one queue");
-            self.state = BlockRuntimeState::Inline(BlockWorker {
-                resources: resources.pop().unwrap(),
-                rate_limiter: self.rate_limiter.clone(),
-                discard_supported: self.acked_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0,
-                active_state: ActiveState { mem, interrupt },
-                metrics: self.metrics.clone(),
-            });
-        } else {
-            assert_eq!(
-                worker_handles.len(),
-                resources.len(),
-                "one worker must be spawned for each block queue"
-            );
-            let queue_configs = resources.iter().map(|r| r.queue.config.clone()).collect();
-            for (resources, handle) in resources.into_iter().zip(&worker_handles) {
-                handle.start(BlockWorker {
-                    resources,
-                    rate_limiter: self.rate_limiter.clone(),
-                    discard_supported: self.acked_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0,
-                    active_state: ActiveState {
-                        mem: mem.clone(),
-                        interrupt: interrupt.clone(),
-                    },
-                    metrics: self.metrics.clone(),
-                })?;
-            }
-            self.state = BlockRuntimeState::Threaded(ThreadedActive {
-                worker_handles,
-                interrupt,
-                queue_configs,
-                paused: Vec::new(),
-            });
         }
+
+        let discard_supported = self.acked_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0;
+        let workers = resources
+            .into_iter()
+            .map(|resources| BlockWorker {
+                resources,
+                rate_limiter: self.rate_limiter.clone(),
+                discard_supported,
+                active_state: ActiveState {
+                    mem: mem.clone(),
+                    interrupt: interrupt.clone(),
+                },
+                metrics: self.metrics.clone(),
+            })
+            .collect();
+        self.state = DeviceState::Active(ActiveDevice::start(
+            workers,
+            worker_handles,
+            interrupt,
+            |workers| {
+                workers
+                    .iter()
+                    .map(|w| w.resources.queue.config.clone())
+                    .collect()
+            },
+        )?);
         Ok(())
     }
 
     fn is_activated(&self) -> bool {
-        matches!(
-            &self.state,
-            BlockRuntimeState::Inline(_) | BlockRuntimeState::Threaded(_)
-        )
+        self.state.is_active()
     }
 
     fn deactivate(&mut self) {
@@ -1014,43 +943,15 @@ impl VirtioDevice for VirtioBlock {
     fn _reset(&mut self) -> bool {
         // Resources coming back from workers were drained by `BlockWorker::into_resources`; only
         // the ones that never left the device still need it.
-        let state = std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder);
-        let (resources, worker_handles) = match state {
-            BlockRuntimeState::Threaded(active) => {
-                assert_eq!(
-                    active.worker_handles.len(),
-                    active.queue_configs.len(),
-                    "active block queues must have one worker each"
-                );
-                // Workers taken back for a snapshot are the device's already, and their threads
-                // are parked: they hand their resources back here.
-                let resources = if active.paused.is_empty() {
-                    active
-                        .worker_handles
-                        .iter()
-                        .map(|handle| {
-                            handle
-                                .reset()
-                                .expect("an active queue group worker must answer a reset")
-                                .expect("an active queue group worker must return its resources")
-                        })
-                        .collect()
-                } else {
-                    active
-                        .paused
-                        .into_iter()
-                        .map(QueueGroupWorker::into_resources)
-                        .collect()
-                };
-                (resources, active.worker_handles)
-            }
-            BlockRuntimeState::Inline(worker) => (vec![worker.into_resources()], Vec::new()),
-            BlockRuntimeState::Configuring(mut resources, worker_handles) => {
-                resources.iter_mut().for_each(BlockResources::reset);
-                (resources, worker_handles)
-            }
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
-        };
+        let (resources, worker_handles) =
+            match std::mem::replace(&mut self.state, DeviceState::Placeholder) {
+                DeviceState::Active(active) => active.into_resources(),
+                DeviceState::Configuring(mut resources, worker_handles) => {
+                    resources.iter_mut().for_each(BlockResources::reset);
+                    (resources, worker_handles)
+                }
+                DeviceState::Placeholder => unreachable!("not a runtime state"),
+            };
 
         assert_eq!(
             resources.len(),
@@ -1058,12 +959,12 @@ impl VirtioDevice for VirtioBlock {
             "reset must recover every block queue"
         );
 
-        self.state = BlockRuntimeState::Configuring(resources, worker_handles);
+        self.state = DeviceState::Configuring(resources, worker_handles);
         true
     }
 
     fn reset_queues(&mut self) {
-        if let BlockRuntimeState::Configuring(resources, _) = &mut self.state {
+        if let DeviceState::Configuring(resources, _) = &mut self.state {
             for resource in resources {
                 resource.queue.reset();
             }
@@ -1071,81 +972,41 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn kick(&mut self) {
-        match &mut self.state {
-            BlockRuntimeState::Threaded(active) => {
-                // Workers taken back for a snapshot go back to their threads first, as activation
-                // hands them over.
-                for (handle, worker) in active.worker_handles.iter().zip(active.paused.drain(..)) {
-                    if let Err(err) = handle.start(worker) {
-                        error!("Failed to restart a block worker: {err}");
-                    }
-                }
-                for handle in &active.worker_handles {
-                    if let Err(err) = handle.kick() {
-                        error!("Failed to kick a block worker: {err}");
-                    }
-                }
-            }
-            BlockRuntimeState::Inline(_) => self.notify_queue_events(),
-            BlockRuntimeState::Configuring(_, _) => {}
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+        // Worker threads are restarted and kicked; an inline data path is poked through its queue
+        // eventfds instead.
+        if let Some(active) = self.state.active_mut()
+            && !active.kick()
+        {
+            self.notify_queue_events();
         }
     }
 
     fn commit_dirty(&self) {
         match &self.state {
-            BlockRuntimeState::Configuring(resources, _) => {
+            DeviceState::Configuring(resources, _) => {
                 for resource in resources {
                     resource.queue.commit_dirty();
                 }
             }
-            BlockRuntimeState::Inline(worker) => worker.resources.queue.commit_dirty(),
-            // A running worker commits its own queue on its thread; the workers taken back for a
-            // snapshot are committed here.
-            BlockRuntimeState::Threaded(active) => {
-                for handle in &active.worker_handles {
-                    if let Err(err) = handle.commit_dirty() {
-                        error!("Failed to commit the dirty pages of a block worker: {err}");
-                    }
-                }
-                for worker in &active.paused {
-                    worker.resources.queue.commit_dirty();
-                }
-            }
-            BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
+            DeviceState::Active(active) => active.commit_dirty(),
+            DeviceState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 }
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        match std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder) {
-            BlockRuntimeState::Inline(worker) => worker.shutdown(),
-            // Workers do their own final drain or flush, by cache type, one at a time in queue
-            // order: on their threads, or here for the ones taken back for a snapshot.
-            BlockRuntimeState::Threaded(active) => {
-                for worker in active.paused {
-                    worker.shutdown();
-                }
-                for handle in active.worker_handles {
-                    handle.finish();
+        // A drive that was never activated still owns its disks. They get the same final drain
+        // or flush as an active one; the shared teardown below only covers workers and threads.
+        if let DeviceState::Configuring(resources, _) = &mut self.state {
+            for resource in resources {
+                if let Err(err) = resource.shutdown() {
+                    error!("Failed to drain block device on drop: {:?}", err);
                 }
             }
-            // A drive that was never activated still owns its disks. They get the same final
-            // drain or flush as an active one.
-            BlockRuntimeState::Configuring(mut resources, worker_handles) => {
-                for resource in &mut resources {
-                    if let Err(err) = resource.shutdown() {
-                        error!("Failed to drain block device on drop: {:?}", err);
-                    }
-                }
-                for handle in worker_handles {
-                    // a parked worker owns no runtime resources, it just joins the thread
-                    handle.finish();
-                }
-            }
-            BlockRuntimeState::Placeholder => {}
-        };
+        }
+        // Workers do their own final drain or flush, by cache type; parked threads are joined.
+        self.state.shutdown();
     }
 }
 
@@ -2491,10 +2352,10 @@ mod tests {
 
     /// How many workers the threaded `block` holds, taken back from their threads.
     fn held_workers(block: &VirtioBlock) -> usize {
-        let BlockRuntimeState::Threaded(active) = &block.state else {
+        let DeviceState::Active(ActiveDevice::Threaded { paused, .. }) = &block.state else {
             panic!("the block device must be active on worker threads");
         };
-        active.paused.len()
+        paused.len()
     }
 
     /// Puts a `VIRTIO_BLK_T_GET_ID` request on `vq` without notifying the device, and returns
@@ -2757,7 +2618,7 @@ mod tests {
     fn test_only_the_last_queue_flushes() {
         // Every queue has its own descriptor of the backing file, and one fsync covers them all.
         let mut block = default_mq_block(FileEngineType::Sync, 3);
-        let BlockRuntimeState::Configuring(resources, _) = &mut block.state else {
+        let DeviceState::Configuring(resources, _) = &mut block.state else {
             unreachable!()
         };
         let flushes: Vec<_> = resources.iter().map(|r| r.flushes_disk).collect();
@@ -2767,7 +2628,7 @@ mod tests {
             resource.shutdown().unwrap();
         }
         let single = default_block(FileEngineType::Sync);
-        let BlockRuntimeState::Configuring(resources, _) = &single.state else {
+        let DeviceState::Configuring(resources, _) = &single.state else {
             unreachable!()
         };
         assert!(resources[0].flushes_disk);
@@ -2808,7 +2669,7 @@ mod tests {
 
             assert!(block.reset());
             assert!(!block.queue_config(1).unwrap().ready);
-            let BlockRuntimeState::Configuring(resources, worker_handles) = &block.state else {
+            let DeviceState::Configuring(resources, worker_handles) = &block.state else {
                 panic!("reset must leave the block device configuring");
             };
             assert_eq!(resources.len(), 2);
@@ -2890,7 +2751,7 @@ mod tests {
                 assert!(!block.is_activated());
                 assert_eq!(block.acked_features(), 0);
                 assert!(!block.queue_config(0).unwrap().ready);
-                let BlockRuntimeState::Configuring(_, worker_handles) = &block.state else {
+                let DeviceState::Configuring(_, worker_handles) = &block.state else {
                     panic!("reset must leave the block device configuring");
                 };
                 assert_eq!(!worker_handles.is_empty(), threaded);

@@ -4,7 +4,7 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
 use super::io::FileEngine;
-use crate::devices::virtio::block::virtio::device::{BlockRuntimeState, VirtioBlock};
+use crate::devices::virtio::block::virtio::device::VirtioBlock;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::worker::{
     INLINE_WORKER_TOKEN_BASE, QueueGroupWorker, register_inline_events,
@@ -18,7 +18,7 @@ impl VirtioBlock {
     const PROCESS_RATE_LIMITER: u32 = 1;
 
     fn register_runtime_events(&self, ops: &mut EventOps) {
-        if let BlockRuntimeState::Inline(worker) = &self.state {
+        if let Some(worker) = self.state.inline_worker() {
             register_inline_events(ops, worker.events());
         }
     }
@@ -83,7 +83,7 @@ impl MutEventSubscriber for VirtioBlock {
                 Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
                 Self::PROCESS_RATE_LIMITER => self.process_rate_limiter_event(),
                 token if token >= INLINE_WORKER_TOKEN_BASE => {
-                    if let BlockRuntimeState::Inline(worker) = &mut self.state {
+                    if let Some(worker) = self.state.inline_worker_mut() {
                         worker.process(token - INLINE_WORKER_TOKEN_BASE);
                     }
                 }

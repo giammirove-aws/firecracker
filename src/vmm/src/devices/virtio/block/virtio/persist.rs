@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU16;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::device::{BlockResources, BlockRuntimeState, DiskProperties};
+use super::device::{BlockResources, DiskProperties};
 use super::*;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::{
@@ -20,6 +20,7 @@ use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_RO,
 };
 use crate::devices::virtio::persist::{PersistError, VirtioDeviceState};
+use crate::devices::virtio::worker::DeviceState;
 use crate::rate_limiter::persist::RateLimiterState;
 use crate::rate_limiter::{RateLimiter, SharedRateLimiter};
 use crate::snapshot::Persist;
@@ -78,20 +79,10 @@ impl Persist<'_> for VirtioBlock {
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {
-        let virtio_state = if let BlockRuntimeState::Threaded(active) = &self.state {
-            // `prepare_save` has taken the workers back, so their queues cannot move under the
-            // snapshot.
-            assert!(
-                !active.paused.is_empty(),
-                "a threaded block device is saved only after prepare_save"
-            );
-            VirtioDeviceState::from_device(
-                self,
-                active.paused.iter().map(|worker| &worker.resources.queue),
-            )
-        } else {
-            VirtioDeviceState::from_device(self, self.resources().iter().map(|r| &r.queue))
-        };
+        // A threaded device's workers have been taken back by `prepare_save`, so its queues
+        // cannot move under the snapshot.
+        let virtio_state =
+            VirtioDeviceState::from_device(self, self.resources().iter().map(|r| &r.queue));
         VirtioBlockState {
             id: self.config.drive_id.clone(),
             partuuid: self.config.partuuid.clone(),
@@ -179,7 +170,7 @@ impl Persist<'_> for VirtioBlock {
 
             config,
             rate_limiter: SharedRateLimiter::new(rate_limiter),
-            state: BlockRuntimeState::Configuring(resources, Vec::new()),
+            state: DeviceState::Configuring(resources, Vec::new()),
             worker_queue_evts: Vec::new(),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
         })
@@ -330,6 +321,12 @@ mod tests {
 
     #[test]
     fn test_mq_persistence() {
+        use crate::devices::virtio::generated::virtio_blk::{
+            VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_GET_ID,
+        };
+        use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
+        use crate::vstate::memory::Bytes;
+
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let disk = TempFile::new().unwrap();
             disk.as_file().set_len(0x1000).unwrap();
@@ -339,22 +336,45 @@ mod tests {
             let mut block = VirtioBlock::new(config).unwrap();
             block.spawn_workers(&Arc::new(vec![])).unwrap();
             let mem = default_mem();
-            let vq = VirtQueue::new(GuestAddress(0), &mem, BLOCK_QUEUE_SIZE);
-            set_queue(&mut block, 0, vq.create_queue());
+            let vqs = [
+                VirtQueue::new(GuestAddress(0), &mem, BLOCK_QUEUE_SIZE),
+                VirtQueue::new(GuestAddress(0x4000), &mem, BLOCK_QUEUE_SIZE),
+            ];
+            for (idx, vq) in vqs.iter().enumerate() {
+                set_queue(&mut block, idx, vq.create_queue());
+            }
             block.set_acked_features(block.avail_features());
             block.activate(mem.clone(), default_interrupt()).unwrap();
-            assert!(!block.queue_config(1).unwrap().ready);
-
-            // Unused queues stay idle through the worker and snapshot lifecycle.
             block.kick();
             block.prepare_save();
+
+            // The guest posts one request on each queue after the workers were taken back for
+            // the snapshot, so only the restored workers can complete it.
+            let status_addrs = [GuestAddress(0x8300), GuestAddress(0x9300)];
+            for (vq, status) in vqs.iter().zip(status_addrs) {
+                let hdr = status.0 - 0x300;
+                mem.write_obj::<u32>(VIRTIO_BLK_T_GET_ID, GuestAddress(hdr))
+                    .unwrap();
+                mem.write_obj::<u8>(0xff, status).unwrap();
+                vq.dtable[0].set(hdr, 16, VIRTQ_DESC_F_NEXT, 1);
+                vq.dtable[1].set(
+                    hdr + 0x100,
+                    VIRTIO_BLK_ID_BYTES,
+                    VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                    2,
+                );
+                vq.dtable[2].set(status.0, 1, VIRTQ_DESC_F_WRITE, 0);
+                vq.avail.ring[0].set(0);
+                vq.avail.idx.set(1);
+            }
             block.commit_dirty();
 
             let state = block.save();
             let serialized = bitcode::serialize(&state).unwrap();
             let restored_state = bitcode::deserialize(&serialized).unwrap();
-            let restored =
-                VirtioBlock::restore(BlockConstructorArgs { mem }, &restored_state).unwrap();
+            let mut restored =
+                VirtioBlock::restore(BlockConstructorArgs { mem: mem.clone() }, &restored_state)
+                    .unwrap();
 
             assert_eq!(state.virtio_state.queues.len(), 2);
             assert_eq!(restored.num_queues(), 2);
@@ -368,6 +388,22 @@ mod tests {
                     u16::try_from(idx).unwrap()
                 );
                 assert_eq!(restored.queue_config(idx), block.queue_config(idx));
+            }
+            drop(block);
+
+            restored.spawn_workers(&Arc::new(vec![])).unwrap();
+            restored.activate(mem.clone(), default_interrupt()).unwrap();
+            restored.kick();
+            restored.prepare_save();
+
+            // Every request completes exactly once, on its own queue.
+            for (vq, status) in vqs.iter().zip(status_addrs) {
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().id, 0);
+                assert_eq!(mem.read_obj::<u32>(status).unwrap(), VIRTIO_BLK_S_OK);
+                // With event indices negotiated, the guest's next request must notify the
+                // restored worker.
+                assert_eq!(vq.used.event.get(), vq.avail.idx.get());
             }
         }
     }
