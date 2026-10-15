@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::io::FileEngine;
-use super::worker::{BlockWorker, FlushMode, WorkerHandle};
+use super::io::{BlockIoError, FileEngine};
+use super::worker::{BlockWorker, WorkerHandle};
 use super::{
     BLOCK_QUEUE_SIZE, DEFAULT_BLOCK_NUM_QUEUES, MAX_DISCARD_SECTORS, SECTOR_SHIFT, SECTOR_SIZE,
     VirtioBlockError,
@@ -427,9 +427,60 @@ pub(crate) struct BlockResources {
     pub(crate) queue_idx: u16,
     pub(crate) disk: DiskProperties,
     pub(crate) is_io_engine_throttled: bool,
+    /// Whether this is the device's last queue, the one that flushes the backing file for all of
+    /// them. See [`Self::snapshot`].
+    flushes_disk: bool,
+    /// Whether the final teardown flushes the backing file: only on the last queue of a drive
+    /// whose cache type is writeback. See [`Self::shutdown`].
+    flushes_at_shutdown: bool,
 }
 
 impl BlockResources {
+    /// The resources of queue `queue_idx` of `num_queues`, with a fresh queue eventfd.
+    pub(crate) fn new(
+        queue: Queue,
+        queue_idx: u16,
+        num_queues: u16,
+        cache_type: CacheType,
+        disk: DiskProperties,
+    ) -> Result<Self, VirtioBlockError> {
+        let last_queue = queue_idx + 1 == num_queues;
+        Ok(Self {
+            queue,
+            queue_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
+            queue_idx,
+            disk,
+            is_io_engine_throttled: false,
+            flushes_disk: last_queue,
+            flushes_at_shutdown: last_queue && cache_type == CacheType::Writeback,
+        })
+    }
+
+    /// Completes this queue's pending I/O and, if `flush` is set, flushes the backing file.
+    ///
+    /// Every queue writes through its own descriptor of the same file, and one fsync covers what
+    /// all of them wrote, so only the last queue flushes. That fsync comes after every other queue
+    /// drained, because the data path quiesces queues one at a time in index order.
+    fn quiesce(&mut self, flush: bool, discard: bool) -> Result<(), BlockIoError> {
+        if flush {
+            self.disk.file_engine.drain_and_flush(discard)
+        } else {
+            self.disk.file_engine.drain(discard)
+        }
+    }
+
+    /// Quiesces this queue for a snapshot: completes pending I/O and, on the last queue, flushes
+    /// the backing file whatever the cache type.
+    pub(crate) fn snapshot(&mut self) -> Result<(), BlockIoError> {
+        self.quiesce(self.flushes_disk, false)
+    }
+
+    /// The final quiesce before the disk is dropped: completes pending I/O and, on the last queue
+    /// of a writeback drive, flushes the backing file.
+    pub(crate) fn shutdown(&mut self) -> Result<(), BlockIoError> {
+        self.quiesce(self.flushes_at_shutdown, true)
+    }
+
     /// Drain pending I/O and clear engine throttling
     fn reset(&mut self) {
         // The guest may reuse its buffers once the reset completes, so wait for every operation
@@ -463,17 +514,17 @@ impl VirtioBlock {
             .map_or(DEFAULT_BLOCK_NUM_QUEUES, NonZeroU16::get);
         let mut resources = Vec::with_capacity(usize::from(num_queues));
         for queue_idx in 0..num_queues {
-            resources.push(BlockResources {
-                queue: Queue::new(BLOCK_QUEUE_SIZE),
-                queue_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
+            resources.push(BlockResources::new(
+                Queue::new(BLOCK_QUEUE_SIZE),
                 queue_idx,
-                disk: DiskProperties::new(
+                num_queues,
+                config.cache_type,
+                DiskProperties::new(
                     &config.path_on_host,
                     config.is_read_only,
                     config.file_engine_type,
                 )?,
-                is_io_engine_throttled: false,
-            });
+            )?);
         }
 
         let rate_limiter = config
@@ -685,16 +736,12 @@ impl VirtioBlock {
     /// Prepare device for being snapshotted.
     pub fn prepare_save(&mut self) {
         match &mut self.state {
-            BlockRuntimeState::Inline(worker) => worker.prepare_save(FlushMode::DrainAndFlush),
+            BlockRuntimeState::Inline(worker) => worker.prepare_save(),
+            // One at a time, in queue order, so the last queue flushes after every other drained.
             BlockRuntimeState::Threaded(active) => {
-                let (last, rest) = active
-                    .worker_handles
-                    .split_last()
-                    .expect("threaded block device must have at least one worker");
-                for handle in rest {
-                    handle.pause(FlushMode::Drain);
+                for handle in &active.worker_handles {
+                    handle.pause();
                 }
-                last.pause(FlushMode::DrainAndFlush);
             }
             BlockRuntimeState::Configuring(_, _) => {}
             BlockRuntimeState::Placeholder => unreachable!("not a runtime state"),
@@ -718,7 +765,7 @@ impl VirtioBlock {
                     Ok(queue_evt) => queue_evt,
                     Err(err) => {
                         for handle in spawned {
-                            handle.finish(FlushMode::Drain);
+                            handle.finish();
                         }
                         return Err(VirtioBlockError::EventFd(err));
                     }
@@ -729,7 +776,7 @@ impl VirtioBlock {
                     Ok(worker) => worker,
                     Err(err) => {
                         for handle in spawned {
-                            handle.finish(FlushMode::Drain);
+                            handle.finish();
                         }
                         return Err(VirtioBlockError::ThreadSpawn(err));
                     }
@@ -996,45 +1043,26 @@ impl VirtioDevice for VirtioBlock {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        let flush_mode = match self.config.cache_type {
-            CacheType::Unsafe => FlushMode::Drain,
-            CacheType::Writeback => FlushMode::DrainAndFlush,
-        };
-
         match std::mem::replace(&mut self.state, BlockRuntimeState::Placeholder) {
-            BlockRuntimeState::Inline(mut worker) => match flush_mode {
-                FlushMode::Drain => worker.drain(true),
-                FlushMode::DrainAndFlush => worker.drain_and_flush(true),
-            },
-            BlockRuntimeState::Threaded(mut active) => {
-                let last = active
-                    .worker_handles
-                    .pop()
-                    .expect("threaded block device must have at least one worker");
+            BlockRuntimeState::Inline(worker) => worker.shutdown(),
+            // Workers do their own final drain or flush, by cache type, one at a time in queue
+            // order.
+            BlockRuntimeState::Threaded(active) => {
                 for handle in active.worker_handles {
-                    handle.finish(FlushMode::Drain);
+                    handle.finish();
                 }
-                last.finish(flush_mode);
             }
+            // A drive that was never activated still owns its disks. They get the same final
+            // drain or flush as an active one.
             BlockRuntimeState::Configuring(mut resources, worker_handles) => {
-                let (last, rest) = resources
-                    .split_last_mut()
-                    .expect("block device must have at least one queue");
-                for resource in rest {
-                    if let Err(err) = resource.disk.file_engine.drain(true) {
-                        error!("Failed to drain ops on drop: {:?}", err);
+                for resource in &mut resources {
+                    if let Err(err) = resource.shutdown() {
+                        error!("Failed to drain block device on drop: {:?}", err);
                     }
-                }
-                let result = match flush_mode {
-                    FlushMode::Drain => last.disk.file_engine.drain(true),
-                    FlushMode::DrainAndFlush => last.disk.file_engine.drain_and_flush(true),
-                };
-                if let Err(err) = result {
-                    error!("Failed to drain ops and flush block data: {:?}", err);
                 }
                 for handle in worker_handles {
                     // a parked worker owns no runtime resources, it just joins the thread
-                    handle.finish(FlushMode::Drain);
+                    handle.finish();
                 }
             }
             BlockRuntimeState::Placeholder => {}
@@ -2540,6 +2568,26 @@ mod tests {
         block.activate(mem, default_interrupt()).unwrap();
 
         block.reset();
+    }
+
+    #[test]
+    fn test_only_the_last_queue_flushes() {
+        // Every queue has its own descriptor of the backing file, and one fsync covers them all.
+        let mut block = default_mq_block(FileEngineType::Sync, 3);
+        let BlockRuntimeState::Configuring(resources, _) = &mut block.state else {
+            unreachable!()
+        };
+        let flushes: Vec<_> = resources.iter().map(|r| r.flushes_disk).collect();
+        assert_eq!(flushes, [false, false, true]);
+        for resource in resources {
+            resource.snapshot().unwrap();
+            resource.shutdown().unwrap();
+        }
+        let single = default_block(FileEngineType::Sync);
+        let BlockRuntimeState::Configuring(resources, _) = &single.state else {
+            unreachable!()
+        };
+        assert!(resources[0].flushes_disk);
     }
 
     #[test]

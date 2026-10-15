@@ -151,17 +151,17 @@ impl Persist<'_> for VirtioBlock {
             .map_err(VirtioBlockError::Persist)?;
         let mut resources = Vec::with_capacity(usize::from(num_queues));
         for (queue_idx, queue) in (0..num_queues).zip(queues) {
-            resources.push(BlockResources {
+            resources.push(BlockResources::new(
                 queue,
-                queue_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
                 queue_idx,
-                disk: DiskProperties::new(
+                num_queues,
+                state.cache_type,
+                DiskProperties::new(
                     &state.disk_path,
                     is_read_only,
                     state.file_engine_type.into(),
                 )?,
-                is_io_engine_throttled: false,
-            });
+            )?);
         }
 
         let config_space = ConfigSpace {

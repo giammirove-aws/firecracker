@@ -57,11 +57,11 @@ enum ControlMsg {
     Start(BlockWorker),
     UpdateDiskImage { path: String, read_only: bool },
     Reset,
-    Pause(FlushMode),
+    Pause,
     GetQueueState,
     CommitDirty,
     Kick { resume: bool },
-    Finish(FlushMode),
+    Finish,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -82,13 +82,6 @@ pub(crate) struct WorkerHandle {
     control_evt: EventFd,
     join: JoinHandle<()>,
     queue_evt: EventFd,
-}
-
-/// Determines how pending I/O is handled when a worker pauses or finishes.
-#[derive(Clone, Copy)]
-pub(crate) enum FlushMode {
-    Drain,
-    DrainAndFlush,
 }
 
 macro_rules! unwrap_async_file_engine_or_return {
@@ -277,26 +270,10 @@ impl BlockWorker {
         }
     }
 
-    pub(crate) fn drain_and_flush(&mut self, discard: bool) {
-        if let Err(err) = self.resources.disk.file_engine.drain_and_flush(discard) {
-            error!("Failed to drain ops and flush block data: {:?}", err);
-        }
-    }
-
-    pub(crate) fn drain(&mut self, discard: bool) {
-        if let Err(err) = self.resources.disk.file_engine.drain(discard) {
-            error!("Failed to drain ops: {:?}", err);
-        }
-    }
-
     /// Prepare device for being snapshotted.
-    pub(crate) fn prepare_save(&mut self, flush_mode: FlushMode) {
+    pub(crate) fn prepare_save(&mut self) {
         // Fsync errors are non-fatal; other drain errors are broken invariants.
-        let result = match flush_mode {
-            FlushMode::Drain => self.resources.disk.file_engine.drain(false),
-            FlushMode::DrainAndFlush => self.resources.disk.file_engine.drain_and_flush(false),
-        };
-        match result {
+        match self.resources.snapshot() {
             Ok(()) => {}
             Err(BlockIoError::Async(async_io::AsyncIoError::SyncAll(err))) => {
                 error!("Failed to flush block data for snapshot: {:?}", err);
@@ -309,6 +286,14 @@ impl BlockWorker {
         if matches!(&self.resources.disk.file_engine, FileEngine::Async(_)) {
             self.process_async_completion_queue();
         }
+    }
+
+    /// Final quiesce before the worker is dropped: drain, and flush if the drive is writeback.
+    pub(crate) fn shutdown(mut self) {
+        if let Err(err) = self.resources.shutdown() {
+            error!("Failed to drain ops and flush block data: {:?}", err);
+        }
+        self.resources.is_io_engine_throttled = false;
     }
 
     /// Update the backing file and return the new sector count.
@@ -411,8 +396,8 @@ impl WorkerHandle {
     }
 
     /// Pause data-path processing after completing pending I/O.
-    pub(crate) fn pause(&self, flush_mode: FlushMode) {
-        match self.request_response(ControlMsg::Pause(flush_mode)) {
+    pub(crate) fn pause(&self) {
+        match self.request_response(ControlMsg::Pause) {
             ControlResponse::Paused => {}
             response => panic!("Unexpected block worker pause response: {response:?}"),
         }
@@ -440,8 +425,8 @@ impl WorkerHandle {
     }
 
     /// Stop the worker and wait for its thread to exit.
-    pub(crate) fn finish(self, flush_mode: FlushMode) {
-        if let Err(err) = self.to_worker.send(ControlMsg::Finish(flush_mode)) {
+    pub(crate) fn finish(self) {
+        if let Err(err) = self.to_worker.send(ControlMsg::Finish) {
             error!("Block worker receiver already dropped: {:?}", err);
         }
 
@@ -517,12 +502,12 @@ impl ThreadedWorker {
                 ControlMsg::UpdateDiskImage { path, read_only } => {
                     self.update_disk_image(path, read_only)
                 }
-                ControlMsg::Pause(flush_mode) => self.pause_worker(flush_mode, ops),
+                ControlMsg::Pause => self.pause_worker(ops),
                 ControlMsg::GetQueueState => self.send_queue_state(),
                 ControlMsg::CommitDirty => self.commit_dirty(),
                 ControlMsg::Kick { resume } => self.kick_worker(resume, ops),
                 ControlMsg::Reset => self.reset_worker(ops),
-                ControlMsg::Finish(flush_mode) => self.finish_worker(flush_mode, ops),
+                ControlMsg::Finish => self.finish_worker(ops),
             }
 
             if self.is_finished() {
@@ -580,11 +565,11 @@ impl ThreadedWorker {
         self.reply(ControlResponse::Reset(worker.resources));
     }
 
-    fn pause_worker(&mut self, flush_mode: FlushMode, ops: &mut EventOps) {
+    fn pause_worker(&mut self, ops: &mut EventOps) {
         match std::mem::replace(&mut self.state, WorkerState::Parked) {
             WorkerState::Running(mut worker) => {
                 Self::unregister_runtime_events(&worker.resources, ops);
-                worker.prepare_save(flush_mode);
+                worker.prepare_save();
                 self.state = WorkerState::Paused(worker);
             }
             WorkerState::Paused(worker) => {
@@ -643,23 +628,15 @@ impl ThreadedWorker {
         }
     }
 
-    fn finish_worker(&mut self, flush_mode: FlushMode, ops: &mut EventOps) {
+    fn finish_worker(&mut self, ops: &mut EventOps) {
         match std::mem::replace(&mut self.state, WorkerState::Finished) {
             WorkerState::Running(worker) => {
                 Self::unregister_runtime_events(&worker.resources, ops);
-                Self::flush_worker(worker, flush_mode);
+                worker.shutdown();
             }
-            WorkerState::Paused(worker) => Self::flush_worker(worker, flush_mode),
+            WorkerState::Paused(worker) => worker.shutdown(),
             WorkerState::Parked | WorkerState::Finished => {}
         }
-    }
-
-    fn flush_worker(mut worker: BlockWorker, flush_mode: FlushMode) {
-        match flush_mode {
-            FlushMode::Drain => worker.drain(true),
-            FlushMode::DrainAndFlush => worker.drain_and_flush(true),
-        }
-        worker.resources.is_io_engine_throttled = false;
     }
 
     fn is_finished(&self) -> bool {
@@ -770,10 +747,7 @@ mod tests {
         let handle = WorkerHandle::spawn(Arc::new(vec![]), queue_evt, "fc_test".into()).unwrap();
 
         handle.to_worker.send(ControlMsg::Start(worker)).unwrap();
-        handle
-            .to_worker
-            .send(ControlMsg::Pause(FlushMode::DrainAndFlush))
-            .unwrap();
+        handle.to_worker.send(ControlMsg::Pause).unwrap();
         handle.to_worker.send(ControlMsg::GetQueueState).unwrap();
         handle.control_evt.write(1).unwrap();
 
@@ -788,7 +762,7 @@ mod tests {
             response => panic!("Unexpected block worker response: {response:?}"),
         }
 
-        handle.finish(FlushMode::Drain);
+        handle.finish();
     }
 
     #[test]
@@ -818,10 +792,7 @@ mod tests {
         let handle = WorkerHandle::spawn(Arc::new(vec![]), queue_evt, "fc_test".into()).unwrap();
 
         let pause = || {
-            handle
-                .to_worker
-                .send(ControlMsg::Pause(FlushMode::DrainAndFlush))
-                .unwrap();
+            handle.to_worker.send(ControlMsg::Pause).unwrap();
             handle.control_evt.write(1).unwrap();
             assert!(matches!(
                 handle.from_worker.recv_timeout(RECV_TIMEOUT_SEC).unwrap(),
@@ -859,7 +830,7 @@ mod tests {
         assert_eq!(vq.used.ring[0].get().len, VIRTIO_BLK_ID_BYTES + 1);
         assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
 
-        handle.finish(FlushMode::Drain);
+        handle.finish();
     }
 
     #[test]
