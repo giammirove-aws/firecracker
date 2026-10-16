@@ -12,29 +12,57 @@ from host_tools.cargo_build import run_seccompiler_bin
 
 ITERATIONS = 100
 
+# A cgroup v2 setup, as used in production: the jailer creates a cgroup for each microVM.
+CGROUPS_V2 = ["memory.max=1073741824", "cpu.weight=100"]
+
 pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
 
+def _set_cgroups(microvm, cgroups):
+    """Configure `cgroups`: "none", "v2", or "v2_clone" (v2 with --clone-into-cgroup)."""
+    if cgroups == "none":
+        return ""
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+        pytest.skip("cgroupsv2 only")
+    microvm.jailer.cgroup_ver = 2
+    microvm.jailer.cgroups = CGROUPS_V2
+    microvm.jailer.clone_into_cgroup = cgroups == "v2_clone"
+    return f"_cgroup{cgroups}"
+
+
 @pytest.mark.nonci
-def test_startup_time_new_pid_ns(microvm_factory, guest_kernel, rootfs, metrics):
+@pytest.mark.parametrize("cgroups", ["none", "v2", "v2_clone"])
+def test_startup_time_new_pid_ns(
+    microvm_factory, guest_kernel, rootfs, metrics, cgroups
+):
     """
     Check startup time when jailer is spawned in a new PID namespace.
     """
     for _ in range(ITERATIONS):
         microvm = microvm_factory.build(guest_kernel, rootfs)
+        # Measure this mode alone: the framework enables both by default.
         microvm.jailer.new_pid_ns = True
-        _test_startup_time(microvm, metrics, "new_pid_ns")
+        microvm.jailer.daemonize = False
+        suffix = _set_cgroups(microvm, cgroups)
+        _test_startup_time(microvm, metrics, f"new_pid_ns{suffix}")
         microvm.kill()
 
 
 @pytest.mark.nonci
-def test_startup_time_daemonize(microvm_factory, guest_kernel, rootfs, metrics):
+@pytest.mark.parametrize("cgroups", ["none", "v2", "v2_clone"])
+def test_startup_time_daemonize(
+    microvm_factory, guest_kernel, rootfs, metrics, cgroups
+):
     """
     Check startup time when jailer detaches Firecracker from the controlling terminal.
     """
     for _ in range(ITERATIONS):
         microvm = microvm_factory.build(guest_kernel, rootfs)
-        _test_startup_time(microvm, metrics, "daemonize")
+        # Measure this mode alone: the framework enables both by default.
+        microvm.jailer.daemonize = True
+        microvm.jailer.new_pid_ns = False
+        suffix = _set_cgroups(microvm, cgroups)
+        _test_startup_time(microvm, metrics, f"daemonize{suffix}")
         microvm.kill()
 
 
