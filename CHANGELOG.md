@@ -29,8 +29,8 @@ and this project adheres to
   `cgroup.procs`. The move waits for an RCU grace period, so this removes about
   10-20 ms from each jailed start and snapshot restore. Kernels without
   `CLONE_INTO_CGROUP` keep the previous behaviour. In the default mode, the
-  jailer no longer writes to `cgroup.procs` when it is already in its cgroup,
-  so callers that start it there with `clone3(CLONE_INTO_CGROUP)` get the same
+  jailer no longer writes to `cgroup.procs` when it is already in its cgroup, so
+  callers that start it there with `clone3(CLONE_INTO_CGROUP)` get the same
   saving.
 - [#2046](https://github.com/firecracker-microvm/firecracker/issues/2046): The
   PL061 GPIO controller backing the new aarch64 power button is always attached

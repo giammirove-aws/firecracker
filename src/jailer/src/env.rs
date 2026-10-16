@@ -164,8 +164,9 @@ impl CgroupDir {
 }
 
 // Like `clone`, but when `cgroup_dir` is given the child is created inside that cgroup. On
-// kernels without `clone3` or `CLONE_INTO_CGROUP`, the calling process moves into the cgroup
-// first and then clones, so the child still starts there. The cgroup fds are closed on return
+// kernels without `clone3` or `CLONE_INTO_CGROUP`, or when a seccomp policy blocks `clone3`,
+// the calling process moves into the cgroup first and then clones, so the child still starts
+// there. The cgroup fds are closed on return
 // in both the parent and the child.
 fn clone_into_cgroup(
     flags: libc::c_int,
@@ -199,8 +200,10 @@ fn clone_into_cgroup(
 
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
-        // No `clone3` (ENOSYS), unknown flag (EINVAL) or larger `clone_args` (E2BIG).
-        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::E2BIG) => {
+        // No `clone3` (ENOSYS), unknown flag (EINVAL), larger `clone_args` (E2BIG), or `clone3`
+        // blocked by a seccomp policy (ENOSYS or EPERM). If EPERM is a real permission problem
+        // with the cgroup, the write below fails too and reports it.
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::E2BIG) | Some(libc::EPERM) => {
             // Writing 0 moves the writing process.
             (&cgroup_dir.procs)
                 .write_all(b"0")
@@ -1591,9 +1594,13 @@ mod tests {
         assert_eq!(entries.enumerate().count(), 6);
     }
 
-    // Runs `f` on a new thread whose seccomp filter makes `clone3` fail with ENOSYS, as it does
-    // on kernels without `clone3`. The filter goes away with the thread.
-    fn with_clone3_enosys<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    // Runs `f` on a new thread whose seccomp filter makes `clone3` fail with `errno`: ENOSYS as on
+    // kernels without `clone3`, or what a host seccomp policy returns. The filter goes away with
+    // the thread.
+    fn with_clone3_errno<T: Send + 'static>(
+        errno: i32,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         std::thread::spawn(move || {
             let stmt = |code: u32, k: u32| libc::sock_filter {
                 code: u16::try_from(code).unwrap(),
@@ -1612,7 +1619,7 @@ mod tests {
                 },
                 stmt(
                     libc::BPF_RET | libc::BPF_K,
-                    libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS).unwrap(),
+                    libc::SECCOMP_RET_ERRNO | u32::try_from(errno).unwrap(),
                 ),
                 stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW),
             ];
@@ -1643,14 +1650,21 @@ mod tests {
 
     #[test]
     fn test_clone_into_cgroup_fallback() {
-        // Without clone3, the calling process moves into the cgroup (writing 0 to cgroup.procs
-        // moves the writer), then clones.
+        // Without clone3 (ENOSYS), or with clone3 blocked by a seccomp policy (ENOSYS or EPERM),
+        // the calling process moves into the cgroup (writing 0 to cgroup.procs moves the
+        // writer), then clones.
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            check_clone_into_cgroup_fallback(errno);
+        }
+    }
+
+    fn check_clone_into_cgroup_fallback(errno: i32) {
         let cgroup = TempDir::new().unwrap();
         let path = cgroup.as_path().to_path_buf();
         let procs = path.join("cgroup.procs");
         File::create(&procs).unwrap();
 
-        let pid = with_clone3_enosys(move || {
+        let pid = with_clone3_errno(errno, move || {
             let cgroup_dir = CgroupDir::open(&path, JailerError::CgroupClone).unwrap();
             let pid = clone_into_cgroup(libc::SIGCHLD, Some(cgroup_dir)).unwrap();
             if pid == 0 {
