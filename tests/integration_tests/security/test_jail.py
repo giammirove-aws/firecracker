@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests that verify the jailer's behavior."""
 
+# pylint: disable=too-many-lines
+import errno as errno_codes
 import http.client as http_client
 import os
+import platform
 import resource
+import shlex
 import stat
 import subprocess
 import time
@@ -425,6 +429,276 @@ def test_cgroups(uvm, cgroups_info):
         check_cgroups_v2(test_microvm)
 
 
+def trace_cgroup_attach(vm):
+    """Trace how the jailer attaches to its cgroup. Returns the strace output path."""
+    strace_output_path = Path(vm.path, "strace-attach.out")
+    # -D keeps the jailer as the direct child of the launcher: without --daemonize,
+    # the jailer is the session leader under `screen` and must stay so.
+    vm.add_pre_cmd(
+        [
+            "strace",
+            "-D",
+            "-y",
+            "-e",
+            "trace=write,clone3,pivot_root,mknod,mknodat",
+            "-o",
+            str(strace_output_path),
+        ]
+    )
+    return strace_output_path
+
+
+def clones_into_cgroup(vm):
+    """Whether the jailer creates its process in the cgroup instead of moving."""
+    return vm.jailer.clone_into_cgroup and (vm.jailer.daemonize or vm.jailer.new_pid_ns)
+
+
+# clone3 errors for which the jailer moves itself into the cgroup instead.
+CLONE3_FALLBACK_ERRNOS = ("ENOSYS", "EINVAL", "E2BIG", "EPERM")
+
+
+def check_cgroup_attach(vm, strace_output_path, expect_fallback=None):
+    """
+    Assert how the jailer attached to its cgroup.
+
+    With --clone-into-cgroup and --daemonize or --new-pid-ns, the jailer
+    continues in a process created in the cgroup by one
+    clone3(CLONE_INTO_CGROUP), and nothing writes to cgroup.procs. If clone3
+    fails with one of CLONE3_FALLBACK_ERRNOS (an old kernel, or a seccomp
+    policy), the jailer moves itself with one write instead. Otherwise, the
+    jailer moves itself with one write.
+
+    Only the jailer process the caller spawned is traced. It does the whole
+    setup itself in every mode, as the stock jailer does: the jail (pivot_root)
+    and the device nodes (mknod). With --clone-into-cgroup only the process it
+    clones before exec is created in the cgroup.
+
+    `expect_fallback`: the errno the clone3 must fail with, or None to accept
+    either outcome.
+    """
+    strace_out = strace_output_path.read_text(encoding="utf-8").splitlines()
+    procs_writes = [line for line in strace_out if "/cgroup.procs>" in line]
+    clones = [line for line in strace_out if "CLONE_INTO_CGROUP" in line]
+    if not clones_into_cgroup(vm):
+        assert (len(procs_writes), len(clones)) == (1, 0), strace_out
+        return
+    assert len(clones) == 1, strace_out
+    fell_back = any(f"= -1 {errno} " in clones[0] for errno in CLONE3_FALLBACK_ERRNOS)
+    if expect_fallback is not None:
+        assert f"= -1 {expect_fallback} " in clones[0], strace_out
+    assert len(procs_writes) == (1 if fell_back else 0), strace_out
+    for setup_step in ("pivot_root(", "mknod"):
+        assert any(setup_step in line for line in strace_out), strace_out
+
+
+def check_firecracker_cgroup(vm, cgroups_info, cgroup):
+    """Assert that Firecracker runs in `cgroup`, relative to the cgroup root."""
+    fc_cgroup = Path(f"/proc/{vm.firecracker_pid}/cgroup").read_text(encoding="ascii")
+    assert fc_cgroup.strip() == f"0::/{cgroup.relative_to(cgroups_info.root)}"
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("daemonize", [True, False])
+@pytest.mark.parametrize("new_pid_ns", [True, False])
+@pytest.mark.parametrize("clone_into_cgroup", [True, False])
+def test_cgroups_v2_jailer_modes(
+    uvm, cgroups_info, daemonize, new_pid_ns, clone_into_cgroup
+):
+    """
+    Test that Firecracker runs in its cgroup in every jailer process mode.
+
+    With --clone-into-cgroup and --daemonize or --new-pid-ns, the jailer
+    continues in a process created in the cgroup with clone3(CLONE_INTO_CGROUP);
+    otherwise it moves itself into the cgroup.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = daemonize
+    test_microvm.jailer.new_pid_ns = new_pid_ns
+    test_microvm.jailer.clone_into_cgroup = clone_into_cgroup
+    test_microvm.jailer.cgroups = ["cpu.weight.nice=10", "memory.max=1073741824"]
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    test_microvm.spawn()
+
+    check_cgroups_v2(test_microvm)
+    cg_jail = cgroups_info.root / FC_BINARY_NAME / test_microvm.jailer.jailer_id
+    check_firecracker_cgroup(test_microvm, cgroups_info, cg_jail)
+    check_cgroup_attach(test_microvm, strace_output_path)
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("daemonize", [True, False])
+@pytest.mark.parametrize("new_pid_ns", [True, False])
+@pytest.mark.parametrize("clone_into_cgroup", [True, False])
+def test_parent_cgroup_jailer_modes(
+    uvm, cgroups_info, daemonize, new_pid_ns, clone_into_cgroup
+):
+    """
+    Test joining a pre-created `--parent-cgroup` (no `--cgroup`) in every jailer
+    process mode.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = daemonize
+    test_microvm.jailer.new_pid_ns = new_pid_ns
+    test_microvm.jailer.clone_into_cgroup = clone_into_cgroup
+    # Make it somewhat unique so it doesn't conflict with other test runs
+    parent_cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
+    test_microvm.jailer.parent_cgroup = parent_cgroup
+    cgroups_info.new_cgroup(parent_cgroup)
+    assert len(test_microvm.jailer.cgroups) == 0
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    test_microvm.spawn()
+
+    check_firecracker_cgroup(
+        test_microvm, cgroups_info, cgroups_info.root / parent_cgroup
+    )
+    check_cgroup_attach(test_microvm, strace_output_path)
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("parent_only", [False, True])
+def test_cgroups_v2_started_in_cgroup(uvm, cgroups_info, parent_only):
+    """
+    Test that, in default mode, the jailer doesn't write to cgroup.procs when the
+    caller started it inside its cgroup, e.g. with clone3(CLONE_INTO_CGROUP).
+
+    The write would wait for an RCU grace period even though the jailer is
+    already a member. Covers --cgroup and a pre-created --parent-cgroup.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = False
+    test_microvm.jailer.new_pid_ns = False
+    if parent_only:
+        cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
+        test_microvm.jailer.parent_cgroup = cgroup
+    else:
+        cgroup = f"{FC_BINARY_NAME}/{test_microvm.jailer.jailer_id}"
+        test_microvm.jailer.cgroups = ["cpu.weight.nice=10"]
+    cgroups_info.new_cgroup(cgroup)
+    procs = cgroups_info.root / cgroup / "cgroup.procs"
+
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    # Start the jailer inside its cgroup: an untraced shell moves itself there, then
+    # execs strace and the jailer. Without --daemonize the framework runs the command
+    # through `screen` and a shell, hence the quoting.
+    script = shlex.quote(f'echo 0 > {procs} && exec "$@"')
+    test_microvm.add_pre_cmd(["sh", "-c", script, "sh"])
+    test_microvm.spawn()
+
+    check_firecracker_cgroup(test_microvm, cgroups_info, cgroups_info.root / cgroup)
+    strace_out = strace_output_path.read_text(encoding="utf-8").splitlines()
+    assert not [line for line in strace_out if "/cgroup.procs>" in line], strace_out
+
+
+# Runs the command in argv[4:] with a seccomp filter that makes syscall
+# argv[1] fail with errno argv[3], like a host seccomp policy. If argv[2] isn't
+# "-", only calls whose first argument equals it fail.
+BLOCK_SYSCALL = """
+import ctypes, os, sys
+class F(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint)]
+class P(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(F))]
+nr, arg0, err = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+ld_nr, jeq, ret = 0x20, 0x15, 0x06
+deny, allow = F(ret, 0, 0, 0x00050000 | err), F(ret, 0, 0, 0x7FFF0000)
+if arg0 == "-":
+    insns = [F(ld_nr, 0, 0, 0), F(jeq, 0, 1, nr), deny, allow]
+else:  # the low 32 bits of the first argument are at offset 16
+    insns = [F(ld_nr, 0, 0, 0), F(jeq, 0, 3, nr), F(ld_nr, 0, 0, 16),
+             F(jeq, 0, 1, int(arg0)), deny, allow]
+prog = (F * len(insns))(*insns)
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.prctl(38, 1, 0, 0, 0) == 0  # PR_SET_NO_NEW_PRIVS
+assert libc.prctl(22, 2, ctypes.byref(P(len(insns), prog))) == 0  # SECCOMP_MODE_FILTER
+os.execvp(sys.argv[4], sys.argv[4:])
+"""
+# Syscall numbers used with BLOCK_SYSCALL.
+SYSCALL_NR = {
+    "x86_64": {"clone3": 435},
+    "aarch64": {"clone3": 435},
+}[platform.machine()]
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("errno", ["ENOSYS", "EPERM"])
+@pytest.mark.parametrize("new_pid_ns", [True, False])
+def test_cgroups_v2_clone3_blocked(uvm, cgroups_info, errno, new_pid_ns):
+    """
+    Test the fallback when clone3 fails, e.g. under a host seccomp policy: the
+    jailer moves itself into the cgroup, and Firecracker still runs in it.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    # --daemonize runs the jailer without a shell, so the wrapper needs no quoting.
+    test_microvm.jailer.daemonize = True
+    test_microvm.jailer.new_pid_ns = new_pid_ns
+    test_microvm.jailer.clone_into_cgroup = True
+    test_microvm.jailer.cgroups = ["cpu.weight.nice=10", "memory.max=1073741824"]
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    test_microvm.add_pre_cmd(
+        [
+            "python3",
+            "-c",
+            BLOCK_SYSCALL,
+            str(SYSCALL_NR["clone3"]),
+            "-",
+            str(getattr(errno_codes, errno)),
+        ]
+    )
+    test_microvm.spawn()
+
+    check_cgroups_v2(test_microvm)
+    cg_jail = cgroups_info.root / FC_BINARY_NAME / test_microvm.jailer.jailer_id
+    check_firecracker_cgroup(test_microvm, cgroups_info, cg_jail)
+    check_cgroup_attach(test_microvm, strace_output_path, expect_fallback=errno)
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_parent_cgroup_threaded_child(uvm, cgroups_info):
+    """
+    Test that a jailer started in a threaded child of its --parent-cgroup still
+    moves into the parent.
+
+    A threaded domain's cgroup.procs also lists processes in its threaded
+    children, so it must not be taken as proof that the jailer is already in
+    the target cgroup.
+    """
+    if cgroups_info.version != 2:
+        pytest.skip("cgroupsv2 only")
+    test_microvm = uvm
+    test_microvm.jailer.cgroup_ver = cgroups_info.version
+    test_microvm.jailer.daemonize = False
+    test_microvm.jailer.new_pid_ns = False
+    parent_cgroup = f"custom_cgroup/{test_microvm.id[:8]}"
+    test_microvm.jailer.parent_cgroup = parent_cgroup
+    cgroups_info.new_cgroup(f"{parent_cgroup}/threads")
+    threaded = cgroups_info.root / parent_cgroup / "threads"
+    threaded.joinpath("cgroup.type").write_text("threaded", encoding="ascii")
+
+    strace_output_path = trace_cgroup_attach(test_microvm)
+    # Start the jailer in the threaded child (see test_cgroups_v2_started_in_cgroup).
+    script = shlex.quote(f'echo 0 > {threaded / "cgroup.procs"} && exec "$@"')
+    test_microvm.add_pre_cmd(["sh", "-c", script, "sh"])
+    test_microvm.spawn()
+
+    check_firecracker_cgroup(
+        test_microvm, cgroups_info, cgroups_info.root / parent_cgroup
+    )
+    check_cgroup_attach(test_microvm, strace_output_path)
+
+
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 def test_cgroups_custom_parent(uvm, cgroups_info):
     """
@@ -788,7 +1062,7 @@ def test_cgroupsv2_written_only_once(uvm, cgroups_info):
         "--syscall-times=ns",
         "-y",
         "-e",
-        "write,mkdir,mkdirat",
+        "write,mkdir,mkdirat,clone3",
         "-o",
         strace_output_path,
     ]
@@ -817,6 +1091,16 @@ def test_cgroupsv2_written_only_once(uvm, cgroups_info):
         for line in strace_out
         if "write" in line and f"{uvm.id}/cgroup.procs" in line
     ]
+    # With --clone-into-cgroup, the jailer creates its process directly in the cgroup,
+    # instead of writing to cgroup.procs. strace shows the cgroup as a bare fd, so match the
+    # flag only.
+    clone_lines = [
+        line for line in strace_out if "clone3" in line and "CLONE_INTO_CGROUP" in line
+    ]
+    if clones_into_cgroup(uvm):
+        assert len(write_lines) == 0
+        assert len(clone_lines) == 1
+        write_lines = clone_lines
     mkdir_lines = [
         line
         for line in strace_out

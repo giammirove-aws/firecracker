@@ -238,6 +238,22 @@ impl CgroupConfiguration {
             Self::V2(conf) => setup_cgroup_conf(conf),
         }
     }
+
+    // Writes the cgroup property values without moving the jailer into the cgroups.
+    pub fn write_values(&self) -> Result<(), JailerError> {
+        match self {
+            Self::V1(conf) => write_cgroup_values(conf),
+            Self::V2(conf) => write_cgroup_values(conf),
+        }
+    }
+
+    // Returns the microVM cgroup directory when using cgroups v2, which has a single hierarchy.
+    pub fn v2_location(&self) -> Option<&Path> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(conf) => conf.values().next().map(|cg| cg.base.location.as_path()),
+        }
+    }
 }
 
 // If we call inherit_from_parent_aux(.../A/B/C, file, condition), the following will happen:
@@ -476,6 +492,9 @@ impl Cgroup for CgroupV2 {
     }
 
     fn attach_pid(&self) -> Result<(), JailerError> {
+        if contains_self(&self.base.location) {
+            return Ok(());
+        }
         let pid = process::id();
         let location = &self.base.location.join("cgroup.procs");
 
@@ -485,12 +504,32 @@ impl Cgroup for CgroupV2 {
     }
 }
 
-pub fn setup_cgroup_conf(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
-    // cgroups are iterated two times as some cgroups may require others (e.g cpuset requires
-    // cpuset.mems and cpuset.cpus) to be set before attaching any pid.
+// Returns whether the calling thread is already in the cgroup v2 at `location`, e.g. because
+// the caller created the jailer there with clone3(CLONE_INTO_CGROUP). Writing to cgroup.procs
+// waits for an RCU grace period even when the process is already a member, so the jailer skips
+// the write in that case (the jailer is single-threaded, so its one thread is the process).
+// The cgroup's own cgroup.threads lists exactly the threads in that cgroup. Neither
+// cgroup.procs (which, for a threaded domain, also lists processes in its threaded children)
+// nor paths from /proc/self/cgroup (relative to the cgroup namespace) are exact. Any read error
+// returns false, and the caller writes as before.
+pub fn contains_self(location: &Path) -> bool {
+    // SAFETY: gettid takes no arguments and always succeeds.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) }.to_string();
+    fs::read_to_string(location.join("cgroup.threads"))
+        .is_ok_and(|threads| threads.lines().any(|line| line == tid))
+}
+
+fn write_cgroup_values(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
     for cgroup in conf.values() {
         cgroup.write_values()?;
     }
+    Ok(())
+}
+
+pub fn setup_cgroup_conf(conf: &HashMap<String, impl Cgroup>) -> Result<(), JailerError> {
+    // cgroups are iterated two times as some cgroups may require others (e.g cpuset requires
+    // cpuset.mems and cpuset.cpus) to be set before attaching any pid.
+    write_cgroup_values(conf)?;
     for cgroup in conf.values() {
         cgroup.attach_pid()?;
     }
@@ -832,6 +871,115 @@ mod tests {
                 .unwrap()
                 .contains("cpuset")
         );
+    }
+
+    #[test]
+    fn test_cgroup_conf_v2_write_values_without_attach() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v2_mounts().unwrap();
+        let mut builder =
+            CgroupConfigurationBuilder::new(2, mock_cgroups.proc_mounts_path.to_str().unwrap())
+                .unwrap();
+        builder
+            .add_cgroup_property(
+                "cpuset.mems".to_string(),
+                "1".to_string(),
+                "101",
+                Path::new("fc_test_cgv2"),
+            )
+            .unwrap();
+        let cg_conf = builder.build();
+        let cg_jail = mock_cgroups
+            .sys_cgroups_path
+            .join("unified/fc_test_cgv2/101");
+
+        assert_eq!(cg_conf.v2_location(), Some(cg_jail.as_path()));
+
+        fs::create_dir_all(&cg_jail).unwrap();
+        MockCgroupFs::create_file_with_contents(
+            cg_jail.parent().unwrap().join("cgroup.subtree_control"),
+            "",
+        )
+        .unwrap();
+        cg_conf.write_values().unwrap();
+
+        // The value is written, but no pid is: the caller creates the process in the cgroup.
+        assert_eq!(read_first_line(cg_jail.join("cpuset.mems")).unwrap(), "1\n");
+        assert!(!cg_jail.join("cgroup.procs").exists());
+    }
+
+    fn gettid() -> i64 {
+        // SAFETY: gettid takes no arguments and always succeeds.
+        unsafe { libc::syscall(libc::SYS_gettid) }
+    }
+
+    #[test]
+    fn test_contains_self() {
+        let dir = TempDir::new().unwrap();
+        let threads = dir.as_path().join("cgroup.threads");
+
+        // No cgroup.threads: not a member, so the caller writes as before.
+        assert!(!contains_self(dir.as_path()));
+
+        fs::write(&threads, "1\n23\n").unwrap();
+        assert!(!contains_self(dir.as_path()));
+
+        fs::write(&threads, format!("1\n{}\n23\n", gettid())).unwrap();
+        assert!(contains_self(dir.as_path()));
+
+        // cgroup.procs isn't used: for a threaded domain it also lists processes that are in
+        // its threaded children.
+        fs::write(&threads, "1\n").unwrap();
+        fs::write(
+            dir.as_path().join("cgroup.procs"),
+            format!("{}\n", gettid()),
+        )
+        .unwrap();
+        assert!(!contains_self(dir.as_path()));
+    }
+
+    #[test]
+    fn test_cgroup_v2_attach_skips_when_member() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v2_mounts().unwrap();
+        let unified = mock_cgroups.sys_cgroups_path.join("unified");
+        let cg = CgroupV2::new("101", Path::new("fc_test_cgv2"), &unified).unwrap();
+        let procs = unified.join("fc_test_cgv2/101/cgroup.procs");
+        fs::create_dir_all(procs.parent().unwrap()).unwrap();
+
+        let threads = procs.with_file_name("cgroup.threads");
+
+        // Already a member: nothing is written.
+        fs::write(&threads, format!("{}\n", gettid())).unwrap();
+        fs::write(&procs, "1\n").unwrap();
+        cg.attach_pid().unwrap();
+        assert_eq!(fs::read_to_string(&procs).unwrap(), "1\n");
+
+        // Not a member: the pid is written.
+        fs::write(&threads, "1\n").unwrap();
+        cg.attach_pid().unwrap();
+        assert_eq!(
+            fs::read_to_string(&procs).unwrap(),
+            format!("{}\n", process::id())
+        );
+    }
+
+    #[test]
+    fn test_cgroup_conf_v1_has_no_v2_location() {
+        let mut mock_cgroups = MockCgroupFs::new().unwrap();
+        mock_cgroups.add_v1_mounts().unwrap();
+        let mut builder =
+            CgroupConfigurationBuilder::new(1, mock_cgroups.proc_mounts_path.to_str().unwrap())
+                .unwrap();
+        builder
+            .add_cgroup_property(
+                "cpuset.mems".to_string(),
+                "1".to_string(),
+                "101",
+                Path::new("fc_test_cgv1"),
+            )
+            .unwrap();
+        assert_eq!(builder.build().v2_location(), None);
     }
 
     #[test]

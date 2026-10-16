@@ -26,6 +26,7 @@ jailer --id <id> \
        [--resource-limit <resource=value>] \
        [--daemonize] \
        [--new-pid-ns] \
+       [--clone-into-cgroup] \
        [--...extra arguments for Firecracker]
 ```
 
@@ -102,6 +103,19 @@ Here is an example on how to set multiple resource limits using this argument:
   `CLONE_NEWPID` flag. As a result, the jailer and the process running the exec
   file have different PIDs. The PID of the child process is stored in the jail
   root directory inside `<exec_file_name>.pid`.
+- When present together with cgroup v2 and `--daemonize` or `--new-pid-ns`,
+  `--clone-into-cgroup` makes the jailer create the process it clones before
+  exec (the `--daemonize` fork, or the `--new-pid-ns` clone) directly in the
+  microVM cgroup with `clone3(CLONE_INTO_CGROUP)`, instead of moving itself into
+  the cgroup first. That saves the RCU grace period a move waits for (tens of
+  milliseconds per start). The process model is unchanged: the process the
+  caller spawned does the whole jail setup, as without the flag. The difference
+  is where that setup runs: in the caller's cgroup instead of the microVM
+  cgroup, so the microVM cgroup's limits and policies (for example a device
+  controller program) apply to Firecracker from its first instruction, but not
+  to the jailer's own setup (copying the exec file, the chroot, `mknod`).
+  Without `--daemonize` or `--new-pid-ns`, or with cgroup v1, the flag has no
+  effect.
 - The jailer adheres to the "end of command options" convention, meaning all
   parameters specified after `--` are forwarded to Firecracker. For example,
   this can be paired with the `--config-file` Firecracker argument to specify a
@@ -136,7 +150,16 @@ After starting, the Jailer goes through the following operations:
   identified location (referred to as `<cgroup_base>`), the jailer creates the
   `<cgroup_base>/<parent_cgroup>/<id>` subfolder, and writes the current pid to
   `<cgroup_base>/<parent_cgroup>/<id>/tasks`. Also, the value passed for each
-  `<cgroup_file>` is written to the file.
+  `<cgroup_file>` is written to the file. With `--clone-into-cgroup` (see
+  above), the jailer does not move itself; the clone it makes before exec is
+  created in the cgroup. If `clone3` can't create it there (no
+  `CLONE_INTO_CGROUP`, or a seccomp policy that blocks `clone3` with `ENOSYS` or
+  `EPERM`), the jailer moves itself at that point instead. Without
+  `--clone-into-cgroup`, the jailer skips moving itself if it is already in its
+  cgroup, for example because the caller created the cgroup (or used an existing
+  `--parent-cgroup`) and started the jailer inside it with
+  `clone3(CLONE_INTO_CGROUP)`. Moving a process between cgroups waits for an RCU
+  grace period, so starting the jailer this way avoids that wait in any mode.
 - Call `unshare()` into a new mount namespace, use `pivot_root()` to switch the
   old system root mount point with a new one base in `<chroot_dir>`, switch the
   current working directory to the new root, unmount the old root mount point,

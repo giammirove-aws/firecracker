@@ -48,6 +48,8 @@ pub enum JailerError {
          cgroup under {0}, pass any --cgroup parameters."
     )]
     CgroupMove(PathBuf, io::Error),
+    #[error("Failed to create the microVM process in cgroup {0}: {1}")]
+    CgroupClone(PathBuf, io::Error),
     #[error("Failed to change owner for {0}: {1}")]
     ChangeFileOwner(PathBuf, io::Error),
     #[error("Failed to chdir into chroot directory: {0}")]
@@ -202,6 +204,12 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .takes_value(false)
                 .help("Exec into a new PID namespace."),
         )
+        .arg(Argument::new("clone-into-cgroup").takes_value(false).help(
+            "With cgroup v2 and --daemonize or --new-pid-ns, create the process the \
+                     jailer clones before exec directly in the microVM cgroup, instead of moving \
+                     the jailer there first, which waits for an RCU grace period. The jailer's \
+                     own setup then runs in the caller's cgroup.",
+        ))
         .arg(Argument::new("cgroup").allow_multiple(true).help(
             "Cgroup and value to be set by the jailer. It must follow this format: \
              <cgroup_file>=<value> (e.g cpu.shares=10). This argument can be used multiple times \

@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Added
 
+- New jailer option `--clone-into-cgroup`. With cgroup v2 and `--daemonize` or
+  `--new-pid-ns`, the jailer creates the process it clones before exec directly
+  in the microVM cgroup with `clone3(CLONE_INTO_CGROUP)`, instead of moving
+  itself there first, which saves about 10-20 ms per jailed start and snapshot
+  restore. The jailer's own setup then runs in the caller's cgroup; see
+  [the jailer documentation](docs/jailer.md).
 - [#2046](https://github.com/firecracker-microvm/firecracker/issues/2046): The
   `SendCtrlAltDel` action is now supported on aarch64. It injects a virtual
   power-button press through a new PL061 GPIO controller exposed to the guest as
@@ -23,6 +29,11 @@ and this project adheres to
 
 ### Changed
 
+- The jailer no longer writes to `cgroup.procs` when it is already in its cgroup
+  v2. Moving a process between cgroups waits for an RCU grace period, so callers
+  that create the cgroup and start the jailer inside it with
+  `clone3(CLONE_INTO_CGROUP)` save about 10-20 ms per jailed start and snapshot
+  restore.
 - [#2046](https://github.com/firecracker-microvm/firecracker/issues/2046): The
   PL061 GPIO controller backing the new aarch64 power button is always attached
   and uses one extra GSI, which reduces the GSIs left for VirtIO devices. The
