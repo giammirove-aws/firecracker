@@ -12,41 +12,69 @@ from host_tools.cargo_build import run_seccompiler_bin
 
 ITERATIONS = 100
 
+# Production deployments give the jailer a cgroup v2 per microVM. Without one, the jailer
+# does no cgroup work, so these values exercise its cgroup setup, including the move into
+# the cgroup.
+CGROUPS_V2 = ["memory.max=1073741824", "cpu.weight=100"]
+
 pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
 
+def _set_cgroups(microvm, cgroups):
+    """Configure the jailer's cgroups ("none" or "v2"); return the metric name suffix."""
+    if cgroups == "none":
+        return ""
+    if not os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+        pytest.skip("cgroupsv2 only")
+    microvm.jailer.cgroup_ver = 2
+    microvm.jailer.cgroups = CGROUPS_V2
+    return "_cgroupv2"
+
+
 @pytest.mark.nonci
-def test_startup_time_new_pid_ns(microvm_factory, guest_kernel, rootfs, metrics):
+@pytest.mark.parametrize("cgroups", ["none", "v2"])
+def test_startup_time_new_pid_ns(
+    microvm_factory, guest_kernel, rootfs, metrics, cgroups
+):
     """
     Check startup time when jailer is spawned in a new PID namespace.
     """
     for _ in range(ITERATIONS):
         microvm = microvm_factory.build(guest_kernel, rootfs)
         microvm.jailer.new_pid_ns = True
-        _test_startup_time(microvm, metrics, "new_pid_ns")
+        suffix = _set_cgroups(microvm, cgroups)
+        _test_startup_time(microvm, metrics, f"new_pid_ns{suffix}")
         microvm.kill()
 
 
 @pytest.mark.nonci
-def test_startup_time_daemonize(microvm_factory, guest_kernel, rootfs, metrics):
+@pytest.mark.parametrize("cgroups", ["none", "v2"])
+def test_startup_time_daemonize(
+    microvm_factory, guest_kernel, rootfs, metrics, cgroups
+):
     """
     Check startup time when jailer detaches Firecracker from the controlling terminal.
     """
     for _ in range(ITERATIONS):
         microvm = microvm_factory.build(guest_kernel, rootfs)
-        _test_startup_time(microvm, metrics, "daemonize")
+        suffix = _set_cgroups(microvm, cgroups)
+        _test_startup_time(microvm, metrics, f"daemonize{suffix}")
         microvm.kill()
 
 
 @pytest.mark.nonci
-def test_startup_time_custom_seccomp(microvm_factory, guest_kernel, rootfs, metrics):
+@pytest.mark.parametrize("cgroups", ["none", "v2"])
+def test_startup_time_custom_seccomp(
+    microvm_factory, guest_kernel, rootfs, metrics, cgroups
+):
     """
     Check the startup time when using custom seccomp filters.
     """
     for _ in range(ITERATIONS):
         microvm = microvm_factory.build(guest_kernel, rootfs)
         _custom_filter_setup(microvm)
-        _test_startup_time(microvm, metrics, "custom_seccomp")
+        suffix = _set_cgroups(microvm, cgroups)
+        _test_startup_time(microvm, metrics, f"custom_seccomp{suffix}")
         microvm.kill()
 
 
