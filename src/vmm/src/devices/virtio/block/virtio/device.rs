@@ -632,6 +632,7 @@ impl VirtioBlock {
         &self.resources()[0].disk
     }
 
+    #[cfg(test)]
     pub(crate) fn is_threaded_active(&self) -> bool {
         matches!(self.state, BlockRuntimeState::Threaded(_))
     }
@@ -639,7 +640,8 @@ impl VirtioBlock {
     /// Process a single event in the Virtio queue.
     ///
     /// This function is called by the event manager when the guest notifies us
-    /// about new buffers in the queue.
+    /// about new buffers in the queue. Production events reach the inline worker directly.
+    #[cfg(test)]
     pub(crate) fn process_queue_event(&mut self) {
         if let BlockRuntimeState::Inline(worker) = &mut self.state {
             worker.process_queue_event();
@@ -685,6 +687,8 @@ impl VirtioBlock {
         }
     }
 
+    /// See [`Self::process_queue_event`].
+    #[cfg(test)]
     pub fn process_async_completion_event(&mut self) {
         if let BlockRuntimeState::Inline(worker) = &mut self.state {
             worker.process_async_completion_event();
