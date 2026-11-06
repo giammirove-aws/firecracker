@@ -534,8 +534,19 @@ impl<'a> PrebootApiController<'a> {
             .map_err(VmmActionError::BalloonConfig)
     }
 
-    fn insert_block_device(&mut self, cfg: BlockDeviceConfig) -> Result<VmmData, VmmActionError> {
+    fn insert_block_device(
+        &mut self,
+        mut cfg: BlockDeviceConfig,
+    ) -> Result<VmmData, VmmActionError> {
         self.boot_path = true;
+        // WPF experiment, not for upstream: a virtio drive configured without
+        // `num_queues` gets one queue per vCPU, so clients that don't know the
+        // field (Lambda) run every drive on worker threads.
+        if cfg.num_queues.is_none() && !cfg.is_vhost_user() {
+            cfg.num_queues = std::num::NonZeroU16::new(u16::from(
+                self.vm_resources.machine_config.vcpu_count,
+            ));
+        }
         self.vm_resources
             .machine_config
             .validate_num_queues(&cfg.drive_id, cfg.num_queues)?;
